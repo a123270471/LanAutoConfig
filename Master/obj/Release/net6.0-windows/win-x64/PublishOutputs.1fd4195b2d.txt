@@ -1,0 +1,3 @@
+D:\ip\_trimtest\LanAutoConfigMaster.pdb
+D:\ip\_trimtest\LanAutoConfig.Common.pdb
+D:\ip\_trimtest\LanAutoConfigMaster.exe

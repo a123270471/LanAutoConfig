@@ -1,0 +1,12 @@
+D:\ip\LanAutoConfig\Common\bin\Release\net6.0-windows\LanAutoConfig.Common.deps.json
+D:\ip\LanAutoConfig\Common\bin\Release\net6.0-windows\LanAutoConfig.Common.dll
+D:\ip\LanAutoConfig\Common\bin\Release\net6.0-windows\LanAutoConfig.Common.pdb
+D:\ip\LanAutoConfig\Common\obj\Release\net6.0-windows\Common.csproj.AssemblyReference.cache
+D:\ip\LanAutoConfig\Common\obj\Release\net6.0-windows\Common.GeneratedMSBuildEditorConfig.editorconfig
+D:\ip\LanAutoConfig\Common\obj\Release\net6.0-windows\Common.AssemblyInfoInputs.cache
+D:\ip\LanAutoConfig\Common\obj\Release\net6.0-windows\Common.AssemblyInfo.cs
+D:\ip\LanAutoConfig\Common\obj\Release\net6.0-windows\Common.csproj.CoreCompileInputs.cache
+D:\ip\LanAutoConfig\Common\obj\Release\net6.0-windows\LanAutoConfig.Common.dll
+D:\ip\LanAutoConfig\Common\obj\Release\net6.0-windows\refint\LanAutoConfig.Common.dll
+D:\ip\LanAutoConfig\Common\obj\Release\net6.0-windows\LanAutoConfig.Common.pdb
+D:\ip\LanAutoConfig\Common\obj\Release\net6.0-windows\ref\LanAutoConfig.Common.dll

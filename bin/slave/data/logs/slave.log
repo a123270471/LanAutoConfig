@@ -1,0 +1,6 @@
+﻿2026-10-26 17:45:48.745 [WARN] 启用视觉样式失败（%TEMP% 可能不可写），已降级为经典外观：Access to the path 'C:\Users\Administrator\AppData\Local\Temp\ojrxkebo.32g' is denied.
+2026-10-26 17:45:48.757 [INFO] === 被控端启动 pid=17388 版本=1.0.0 ===
+2026-10-26 17:45:48.757 [INFO] 数据目录=D:\ip\LanAutoConfig\bin\slave\data（%AppData% 不可写，已回退到程序目录）
+2026-10-26 17:45:48.873 [INFO] 已开始监听 UDP 广播（端口 48888），等待控制端下发模板…
+2026-10-26 17:45:48.875 [INFO] 已监听 TCP 指令端口 48889
+2026-10-26 17:45:49.237 [INFO] === 主窗体创建完成，进入消息循环 ===
