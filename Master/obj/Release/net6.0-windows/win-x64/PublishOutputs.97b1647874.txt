@@ -1,3 +1,4 @@
 D:\ip\LanAutoConfig\bin\master-slim\LanAutoConfigMaster.pdb
+D:\ip\LanAutoConfig\bin\master-slim\e_sqlite3.dll
 D:\ip\LanAutoConfig\bin\master-slim\LanAutoConfig.Common.pdb
 D:\ip\LanAutoConfig\bin\master-slim\LanAutoConfigMaster.exe

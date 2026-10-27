@@ -54,6 +54,9 @@ namespace LanAutoConfig.Master
             MinimumSize = new Size(900, 600);
             StartPosition = FormStartPosition.CenterScreen;
             Font = new System.Drawing.Font("Microsoft YaHei UI", 9F);
+            AutoScaleMode = AutoScaleMode.None;   // 布局尺寸由 UiScale 按 DPI 统一换算，避免与 WinForms 自动缩放叠加
+            if (UiScale.Simulated)                // 仅调试：在 100% 屏幕上模拟高 DPI
+                Font = new System.Drawing.Font(Font.FontFamily, Font.Size * UiScale.Factor, Font.Style, Font.Unit);
             try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
             Directory.CreateDirectory(AppConfig.LogDir);
@@ -950,6 +953,8 @@ namespace LanAutoConfig.Master
             _status.Dock = DockStyle.Bottom;
 
             UpdateDhcpPoolPreview();
+
+            UiScale.Apply(this);   // 高 DPI：把上面写死的像素常量按系统缩放比例放大
         }
 
         /// <summary>按当前模板参数刷新 DHCP 地址池预览。</summary>

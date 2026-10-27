@@ -1,8 +1,12 @@
 {
   "version": 2,
-  "dgSpecHash": "b35/vvJ3HBvkvjWCtoM0r3apz/bEH4OHb+9/W6ni4uQF9/kCGMespejqH9s0UtWnc79ea/9cE0EARR36bWUONw==",
+  "dgSpecHash": "BXSJ3X5rIVCQzapFEP9PYU6qpFTX7A6YJ6x+WaWvjQL7OPsGShbYGKkNVJicqnivlhhU8NIXU78Rf+zYhe6LkA==",
   "success": true,
   "projectFilePath": "D:\\ip\\LanAutoConfig\\Slave\\Slave.csproj",
-  "expectedPackageFiles": [],
+  "expectedPackageFiles": [
+    "D:\\ip\\.nugetpackages\\microsoft.netcore.app.runtime.win-x64\\6.0.36\\microsoft.netcore.app.runtime.win-x64.6.0.36.nupkg.sha512",
+    "D:\\ip\\.nugetpackages\\microsoft.windowsdesktop.app.runtime.win-x64\\6.0.36\\microsoft.windowsdesktop.app.runtime.win-x64.6.0.36.nupkg.sha512",
+    "D:\\ip\\.nugetpackages\\microsoft.aspnetcore.app.runtime.win-x64\\6.0.36\\microsoft.aspnetcore.app.runtime.win-x64.6.0.36.nupkg.sha512"
+  ],
   "logs": []
 }

@@ -41,6 +41,9 @@ namespace LanAutoConfig.Slave
             MinimumSize = new Size(600, 520);
             StartPosition = FormStartPosition.CenterScreen;
             Font = new System.Drawing.Font("Microsoft YaHei UI", 9F);
+            AutoScaleMode = AutoScaleMode.None;   // 布局尺寸由 UiScale 按 DPI 统一换算，避免与 WinForms 自动缩放叠加
+            if (UiScale.Simulated)                // 仅调试：在 100% 屏幕上模拟高 DPI
+                Font = new System.Drawing.Font(Font.FontFamily, Font.Size * UiScale.Factor, Font.Style, Font.Unit);
             try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             Directory.CreateDirectory(AppConfig.LogDir);
             _logger = new TextLogger(Path.Combine(AppConfig.LogDir, "slave.log"));
@@ -602,6 +605,8 @@ namespace LanAutoConfig.Slave
             root.Controls.Add(gbSuffix, 0, 2);
             root.Controls.Add(gbLog, 0, 3);
             Controls.Add(root);
+
+            UiScale.Apply(this);   // 高 DPI：把上面写死的像素常量按系统缩放比例放大
         }
 
         private static Label NewValueLabel() => new Label

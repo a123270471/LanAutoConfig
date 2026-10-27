@@ -19,6 +19,7 @@ namespace LanAutoConfig
             try
             {
                 Application.SetHighDpiMode(HighDpiMode.SystemAware);
+                UiScale.Init();   // 读取系统 DPI 缩放比例，供界面按比例换算像素常量
 
                 // EnableVisualStyles 会把主题清单写到 %TEMP%。在某些环境（受限令牌、安全软件、
                 // 只读漫游配置）这一步会 Access Denied，不能让它把整个程序带崩，降级为经典外观即可。

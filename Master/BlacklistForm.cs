@@ -28,6 +28,9 @@ namespace LanAutoConfig.Master
             MinimumSize = new Size(380, 300);
             StartPosition = FormStartPosition.CenterParent;
             Font = new System.Drawing.Font("Microsoft YaHei UI", 9F);
+            AutoScaleMode = AutoScaleMode.None;   // 布局尺寸由 UiScale 按 DPI 统一换算
+            if (UiScale.Simulated)                // 仅调试：在 100% 屏幕上模拟高 DPI
+                Font = new System.Drawing.Font(Font.FontFamily, Font.Size * UiScale.Factor, Font.Style, Font.Unit);
             try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
             var hint = new Label
@@ -60,6 +63,8 @@ namespace LanAutoConfig.Master
             Controls.Add(hint);
 
             Reload();
+
+            UiScale.Apply(this);   // 高 DPI：按系统缩放比例换算像素常量
         }
 
         private void Reload()

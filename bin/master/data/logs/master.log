@@ -61,3 +61,11 @@
 2026-10-26 18:15:49.113 [INFO] DHCP 分配：00-0C-29-8F-01-C8 → 192.168.1.100（已提供）
 2026-10-26 18:15:56.490 [INFO] 已停止广播与接收服务（含 DHCP）。
 2026-10-26 18:17:43.508 [INFO] === 控制端退出 ===
+2026-10-27 13:56:42.559 [WARN] 启用视觉样式失败（%TEMP% 可能不可写），已降级为经典外观：Access to the path 'C:\Users\Administrator\AppData\Local\Temp\tpwi24nw.eqp' is denied.
+2026-10-27 13:56:42.585 [INFO] === 控制端启动 pid=8200 版本=1.0.0 ===
+2026-10-27 13:56:42.585 [INFO] 数据目录=D:\ip\LanAutoConfig\bin\master\data（%AppData% 不可写，已回退到程序目录）
+2026-10-27 13:56:42.978 [INFO] === 主窗体创建完成，进入消息循环 ===
+2026-10-27 13:58:01.285 [WARN] 启用视觉样式失败（%TEMP% 可能不可写），已降级为经典外观：Access to the path 'C:\Users\Administrator\AppData\Local\Temp\ec2cbjy1.tq4' is denied.
+2026-10-27 13:58:01.299 [INFO] === 控制端启动 pid=17104 版本=1.0.0 ===
+2026-10-27 13:58:01.299 [INFO] 数据目录=D:\ip\LanAutoConfig\bin\master\data（%AppData% 不可写，已回退到程序目录）
+2026-10-27 13:58:01.656 [INFO] === 主窗体创建完成，进入消息循环 ===
