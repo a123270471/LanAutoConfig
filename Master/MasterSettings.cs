@@ -43,20 +43,31 @@ namespace LanAutoConfig.Master
             catch { return null; }
         }
 
-        public void Save(string path)
+        /// <summary>最近一次保存失败的原因（成功时为 null），供界面提示用。</summary>
+        public string LastSaveError { get; private set; }
+
+        public bool Save(string path)
         {
             try
             {
                 var dir = Path.GetDirectoryName(path);
                 if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
                 SavedAt = DateTime.Now;
-                // 先写临时文件再替换，避免断电/崩溃留下半个 JSON
+                // 先写临时文件再替换：File.Move(overwrite) 走的是 MoveFileEx 的原子替换。
+                // 原来写的是 Delete + Move —— 两步之间进程被杀/断电，配置就直接没了（终端列表全丢）。
                 string tmp = path + ".tmp";
                 File.WriteAllText(tmp, JsonSerializer.Serialize(this, Opts), Encoding.UTF8);
-                if (File.Exists(path)) File.Delete(path);
-                File.Move(tmp, path);
+                File.Move(tmp, path, overwrite: true);
+                LastSaveError = null;
+                return true;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                // 原来是空 catch：磁盘满/被安全软件锁文件时静默失败，用户只觉得“配置怎么老记不住”
+                LastSaveError = ex.Message;
+                try { File.Delete(path + ".tmp"); } catch { }
+                return false;
+            }
         }
     }
 }

@@ -386,13 +386,11 @@ v3.0（资产 / 在线状态 / 白名单，本轮进行中）：
     - 被控端会拒绝三种情况并写日志：没收到模板（算不出主机名/IP）、已经上报过（改号会和控制端列表打架）、
       后缀非法或换算出的 IP 越界；
     - 兼容性：新消息类型不改动已有消息体，`Magic` 仍是 `LANAC-V3`；老被控端收到只会记一条“无法解析”后丢弃。
-62. **多套模板方案库**（`Common/TemplateLibrary.cs`、`Common/AppConfig.cs`、`Master/MasterForm.cs`）：
-    - 现场常有几种装机方案（如“财务网段”“研发网段”“DMZ 网段”），每套的主机名规则/IP 段/网关/DNS 都不同，
-      原本只能手工在一张模板上反复改；现在支持把当前“模板设置”**另存为命名方案**，随时一键切换；
-    - 方案落盘到 `%AppData%\LanAutoConfig\templatelib.json`（不可写时降级到程序目录 `data\`），格式 `TemplateScheme{ Name, Template, SavedAt }`；
-    - 控制端“模板设置”页新增【模板方案库】分组：下拉选方案 →【应用】把该方案的模板灌回所有输入框；【另存为】以当前输入框内容新存一个方案；【删除】删掉选中方案；
-    - 写盘走“临时文件 + 改名替换”，避免写到一半断电/崩溃留下半截 JSON；
-    - 纯字符串/JSON 实现，不依赖第三方库，单文件自包含发布不受影响。
+62. ~~**多套模板方案库**~~ —— **已按现场要求移除**：
+    - 原实现为 `Common/TemplateLibrary.cs` + 模板页的【模板方案库】分组（下拉选方案 / 应用 / 另存为 / 删除），
+      落盘 `%AppData%\LanAutoConfig\templatelib.json`；源码、界面分组与 `AppConfig.TemplateLibraryPath` 均已删除；
+    - 现场实际更习惯直接改模板输入框（一套机器一个网段，很少来回切），方案库反而多一层操作、还多一份要维护的 JSON，
+      故整体去掉。历史上存过的 `templatelib.json` 不再被读取，可自行删除。
 63. **自定义命令/脚本下发 ★**（`Common/NetMessages.cs`、`Slave/LocalNetChanger.cs`、`Slave/TcpCommandListener.cs`、
     `Slave/SlaveForm.cs`、`Master/CustomCmdForm.cs`、`Master/MasterForm.cs`）：
     - 现场难免要临时跑点东西——查网卡驱动版本、拉个注册表、批量装个小工具——又不想每台 RDP 上去手敲；
@@ -501,3 +499,43 @@ v3.0（资产 / 在线状态 / 白名单，本轮进行中）：
     - **兼容**：PowerShell 执行器不动——它在脚本里已设 `[Console]::OutputEncoding = UTF8`，
       输出本来就是 UTF-8，解码正确；只有 CMD 分支需要按 OEM 处理；
     - **验证**：自测里用**真实 `cmd.exe` 输出**（而不是人造字节）验证中文能正确解出，38 项断言全过。
+75. **控制端界面：更紧凑、视觉统一**（`Master/MasterForm.cs`）：
+    - “模板配置”页删掉方案库分组后重排：行高从 112/200/106/96/92 收到 116/192/98/76（含 6px 卡片间距），
+      整页少了约 100px 空白，一屏能看全广播服务+模板参数+DHCP+名单；
+    - 新增三处统一外观的小工具：`NewGroup()`（分组框统一 `Margin` 底部 6px、文字色统一）、
+      `MakePrimary()`（主操作按钮蓝底白字扁平，用在【开始发布模板】【下发执行命令】）、
+      `MakeDanger()`（不可逆操作文字标红，用在【重置会话】）；
+    - 终端列表表头改自绘（`EnableHeadersVisualStyles = false`）：浅灰底 + 加粗 + 左对齐、无主题立体渐变；
+      行加斑马纹（隔行 `#F9FAFB`）、选中色改淡蓝，密集表格不串行；`EnableDoubleBuffer` 反射开双缓冲，
+      每次回结果重画不再整片闪；
+    - 说明：列表仍保持 `AutoSizeColumnsMode.Fill`（紧凑、无横向滚动条），**没有**回到宽列+折行方案。
+76. **代码审查修复：崩溃风险 / 界面冻结 / 静默失败 / 老 bug**（`Common`、`Master`、`Slave` 多文件）：
+    - **会崩进程**：`HeartbeatService.Tick` 是线程池回调，内部 `PickLocalIp`→`GetIPProperties` 在网卡
+      正在重配时会抛异常，未捕获即**终止进程**（界面表现为“程序莫名没了”）。现在整体兜 try/catch 并限流记录；
+    - **界面冻结**：`VerifySelected`/`BatchRebootSelected`/`BatchShutdownSelected`/`BatchSetAutostartSelected`/
+      分批重启的每批、以及“重启后自动验收”都在 UI 线程同步调 `TcpSend`（5s 超时×2 次），
+      60 台连不上的终端会让窗口“未响应”十分钟。统一改为 `SendBatchBackground()` 后台逐台发送、
+      `SafeUi` 回写结果；`LogLine` 也改成任意线程可调用（自动切回 UI 线程）；
+    - **永久失聪**：`TcpServerService` / `TcpCommandListener` 的 accept 循环原来是 `catch { break; }`，
+      任何一次非取消异常（句柄耗尽、网卡重配）都会跳出去且**日志空白**，控制端/被控端再也收不到连接。
+      现在区分“正常停止”和“异常”，后者记日志后 500ms 重试；
+    - **DHCP 静默停服**：`DhcpServer` 收包 `catch { break; }`，Windows 上收到 ICMP 端口不可达后
+      下一次 `Receive` 会报 10054，就此退出，但界面仍显示“DHCP: 已开启”，新机器拿不到地址。改为记日志后继续；
+    - **UDP 广播静默失败**：`catch { }` 吞掉发送异常，选错网卡时界面显示“运行中”却一台都收不到。改为限流记录；
+    - **大消息被静默截断**：`TcpLineReader` 上限 64KB 时超出即截断且不报错，自定义命令输出大的
+      （`dir /s`、`systeminfo`）整条结果被对端丢弃，下发侧却显示“已下发成功”。上限提到 1MB，
+      超限**明确抛错**；被控端回传前把输出截到 10 万字符并注明；
+    - **半开连接泄漏**：`ReceiveTimeout` 对异步 `ReadAsync` 无效，对端“连上没发完就断电”会永久占着 socket。
+      改用 `ReadAsync(...).WaitAsync(15s)` 兜底；
+    - **自定义命令卡 UI**：被控端 `OnCustomCommand` 原来 `Task.Run(...).GetAwaiter().GetResult()` 在 UI 线程
+      同步等，一条慢命令能把界面锁死到超时，后续指令（包括关机/重启）全部排队。改为纯后台执行，
+      网卡别名在 UI 线程先取好；`TimeoutSeconds` 也真正生效（之前写死 60 秒）；
+    - **内存状态不随会话清理**：`_rebootSent` 在重置/停止后不清空，新批次开局就会给上次没重启成功的机器
+      补发它根本没参与过的“验收”指令。现在重置与停止都清空（并加锁，因为下发在后台线程）；
+    - **老 bug：网卡选择从未被保存**：`SaveSettings` 用 `_cmbAdapter.SelectedItem as NetworkAdapterInfo`，
+      但下拉框元素是 `BroadcastAdapter`，转换永远为 null；`LoadSettings` 恢复时同样转错 → “选的广播网卡
+      下次启动又变回去”。两处都改成按 `BroadcastAdapter.Adapter.Alias` 存取；
+    - **端口抢占**：控制端监听开了 `SO_REUSEADDR`（为了“关掉立刻重开”不被 TIME_WAIT 卡住），
+      于是两个控制端能同时绑 48889 并互相抢连接。加单实例互斥体 `Global\LanAutoConfigMaster.SingleInstance`；
+    - **重置与下发无互斥**：下发循环还在跑时重置会话，后台仍按旧会话逐台发，日志显示“已下发”，
+      实际全被被控端按“会话不一致”丢弃。现在 `_dispatching` 时禁止重置并提示。

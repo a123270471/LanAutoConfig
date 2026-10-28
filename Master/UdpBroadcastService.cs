@@ -36,11 +36,14 @@ namespace LanAutoConfig.Master
                 _running = true;
                 _burst = true;   // 开播后先快发一阵，让正在开机的被控端几乎立刻收到模板
                 _cts = new CancellationTokenSource();
-                _ = Task.Run(() => BroadcastLoop(_cts.Token));
+                var myCts = _cts;
+                _ = Task.Run(() => BroadcastLoop(myCts.Token));
+                // 快发窗口结束后回到常规周期。必须校验“还是不是这一轮”：
+                // 否则“停止 → 10 秒内又开始”时，上一轮遗留的延时任务会把新会话的快发也关掉。
                 _ = Task.Run(async () =>
                 {
-                    try { await Task.Delay(AppConfig.BroadcastFastWindowMs); } catch { }
-                    _burst = false;
+                    try { await Task.Delay(AppConfig.BroadcastFastWindowMs, myCts.Token); } catch { return; }
+                    if (ReferenceEquals(_cts, myCts) && _running) _burst = false;
                 });
                 Log?.Invoke($"UDP 广播已启动，本机 IP={localIp}，端口 {AppConfig.UdpPort}，会话 {sessionId.Substring(0, 8)}…" +
                             $"（前 {AppConfig.BroadcastFastWindowMs / 1000} 秒每 {AppConfig.BroadcastFastIntervalMs}ms 快发，之后每 {AppConfig.BroadcastIntervalMs}ms）");
@@ -65,6 +68,7 @@ namespace LanAutoConfig.Master
         private async Task BroadcastLoop(CancellationToken ct)
         {
             var ep = new IPEndPoint(IPAddress.Broadcast, AppConfig.UdpPort);
+            int consecutiveErrors = 0;
             while (_running && !ct.IsCancellationRequested)
             {
                 try
@@ -73,9 +77,23 @@ namespace LanAutoConfig.Master
                         _template.Gateway, _template.Dns1, _template.Dns2, _template.HostNamePrefix, _template.IsDhcp);
                     string json = JsonHelper.Serialize(msg);
                     byte[] bytes = Encoding.UTF8.GetBytes(json);
-                    await _udp.SendAsync(bytes, bytes.Length, ep);
+                    var udp = _udp;
+                    if (udp == null) break;
+                    await udp.SendAsync(bytes, bytes.Length, ep);
+                    if (consecutiveErrors > 0)
+                    {
+                        consecutiveErrors = 0;
+                        Log?.Invoke("UDP 广播已恢复正常");
+                    }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    // 原来这里是空 catch：广播发不出去（选错网卡/网卡被禁用/被防火墙拦）时
+                    // 界面照样显示“广播: 运行中”，被控端一台都收不到，日志一片空白。
+                    if (ct.IsCancellationRequested || !_running) break;
+                    if (consecutiveErrors++ == 0)
+                        Log?.Invoke($"[UDP 广播] 发送失败（后续同类错误不再重复记录）：{ex.Message}");
+                }
                 int wait = _burst ? AppConfig.BroadcastFastIntervalMs : AppConfig.BroadcastIntervalMs;
                 try { await Task.Delay(wait, ct); }
                 catch { break; }

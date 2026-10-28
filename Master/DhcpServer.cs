@@ -139,11 +139,26 @@ namespace LanAutoConfig.Master
 
         private async Task LoopAsync(CancellationToken ct)
         {
+            int recvErrors = 0;
             while (Running && !ct.IsCancellationRequested)
             {
                 UdpReceiveResult res;
-                try { res = await _udp.ReceiveAsync(); }
-                catch { break; }
+                try
+                {
+                    res = await _udp.ReceiveAsync();
+                    recvErrors = 0;
+                }
+                catch (Exception ex)
+                {
+                    if (!Running || ct.IsCancellationRequested) break;   // 正常停止
+                    // 不能直接 break：Windows 上收到 ICMP 端口不可达后，下一次 Receive 会报
+                    // WSAECONNRESET(10054)，若就此退出，DHCP 静默停服而界面仍显示“已开启”，
+                    // 新开机的被控端拿不到地址，整批装机卡在第一步还查不出原因。
+                    if (recvErrors++ == 0)
+                        Log?.Invoke($"[DHCP] 接收报文出错（继续服务，后续同类错误不再重复记录）：{ex.Message}");
+                    try { await Task.Delay(200, ct); } catch { break; }
+                    continue;
+                }
                 try
                 {
                     byte[] reply;

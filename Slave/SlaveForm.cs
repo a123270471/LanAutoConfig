@@ -309,24 +309,40 @@ namespace LanAutoConfig.Slave
         }
 
         /// <summary>把一条消息回传给控制端（结果/验收结论等）。</summary>
+        /// <summary>回传控制端（在 UI 线程调用）。</summary>
         private bool SendToMaster(NetMessage msg)
+            => SendToMasterCore(msg, (_cmbAdapter?.SelectedItem as NetworkAdapterInfo)?.Alias, uiThread: true);
+
+        /// <summary>
+        /// 回传控制端（在后台线程调用）：网卡别名必须由调用方在 UI 线程先取好传进来，
+        /// 日志也切回 UI 线程写——后台线程直接碰控件是不允许的。
+        /// </summary>
+        private bool SendToMasterFromBg(NetMessage msg, string adapterAlias)
+            => SendToMasterCore(msg, adapterAlias, uiThread: false);
+
+        private bool SendToMasterCore(NetMessage msg, string adapterAlias, bool uiThread)
         {
+            Action<string> log = uiThread ? (Action<string>)LogLine : m => SafeUi(() => LogLine(m));
             if (string.IsNullOrEmpty(_masterIp))
             {
-                LogLine("[拒绝] 尚未收到模板，不知道控制端地址，无法回传");
+                log("[拒绝] 尚未收到模板，不知道控制端地址，无法回传");
                 return false;
             }
-            string sendIp = ResolveReplySourceIp();
+            string sendIp = ResolveReplySourceIp(adapterAlias);
             bool ok = TcpSend.SendTo(_masterIp, AppConfig.TcpPort, msg, sendIp, out string err);
             if (!ok && !string.IsNullOrEmpty(sendIp))
             {
                 // 绑定源地址失败（临时地址还在 DAD 收敛、或该地址与实际路由不符）→ 退回系统自动选源再试一次
-                LogLine($"回传绑定源 {sendIp} 失败（{err}），改用系统默认源地址重试…");
+                log($"回传绑定源 {sendIp} 失败（{err}），改用系统默认源地址重试…");
                 ok = TcpSend.SendTo(_masterIp, AppConfig.TcpPort, msg, null, out err);
             }
-            if (!ok) LogLine("回传控制端失败：" + err);
+            if (!ok) log("回传控制端失败：" + err);
             return ok;
         }
+
+        /// <summary>回传用的源地址（UI 线程版：从下拉框取网卡）。</summary>
+        private string ResolveReplySourceIp()
+            => ResolveReplySourceIp((_cmbAdapter?.SelectedItem as NetworkAdapterInfo)?.Alias);
 
         /// <summary>
         /// 回传控制端时该用哪个源地址：
@@ -334,11 +350,9 @@ namespace LanAutoConfig.Slave
         /// 不能无脑用 <c>GetIpv4ByAdapter</c> 的返回值 —— 它只取“第一个” IPv4，
         /// 加了临时地址后会返回原来那个不同网段的地址，导致回传绑不上/发不出去。
         /// </summary>
-        private string ResolveReplySourceIp()
+        private string ResolveReplySourceIp(string alias)
         {
-            var adp = _cmbAdapter?.SelectedItem as NetworkAdapterInfo;
-            if (adp == null) return null;
-            string alias = adp.Alias;
+            if (string.IsNullOrEmpty(alias)) return null;
 
             string temp = _reach.TempIp;
             if (!string.IsNullOrEmpty(temp) && NetworkHelper.HasIpv4(alias, temp)) return temp;
@@ -373,31 +387,55 @@ namespace LanAutoConfig.Slave
             _lblStatus.Text = $"正在执行自定义{(string.Equals(cmd.Shell, "cmd", StringComparison.OrdinalIgnoreCase) ? "命令" : "脚本")}（超时 {timeout}s）…";
             LogLine($"收到自定义命令：shell={cmd.Shell} 超时={timeout}s（长度 {cmd.Script?.Length ?? 0}）");
 
-            PsResult r;
-            try
-            {
-                // 在后台线程执行，避免大脚本卡死 UI；超时由执行器兜底（60s 硬上限）
-                r = Task.Run(() => _changer.ExecShell(cmd.Shell, cmd.Script ?? "")).GetAwaiter().GetResult();
-            }
-            catch (Exception ex)
-            {
-                r = new PsResult { Success = false, Error = "执行异常：" + ex.Message, ExitCode = -1 };
-            }
+            // 在 UI 线程先取好“回传该用哪块网卡”，后台线程不能再碰控件
+            string adapterAlias = (_cmbAdapter?.SelectedItem as NetworkAdapterInfo)?.Alias;
 
-            var res = new SlaveCustomResultMsg(_sessionId)
+            // 整个执行 + 回传都放后台：之前用 Task.Run(...).GetAwaiter().GetResult() 在 UI 线程同步等，
+            // 一条慢命令就能把界面锁死到超时（最长 600 秒），期间后续指令全部排队，关机/重启指令会被拖后。
+            Task.Run(() =>
             {
-                LocalMac = cmd.LocalMac,
-                Success = r.Success,
-                ExitCode = r.ExitCode,
-                StdOut = r.Output ?? "",
-                StdErr = r.Error ?? ""
-            };
-            SendToMaster(res);
+                PsResult r;
+                try
+                {
+                    r = _changer.ExecShell(cmd.Shell, cmd.Script ?? "", timeout);
+                }
+                catch (Exception ex)
+                {
+                    r = new PsResult { Success = false, Error = "执行异常：" + ex.Message, ExitCode = -1 };
+                }
 
-            _lblStatus.Text = r.Success ? "自定义命令执行完成" : "自定义命令执行失败";
-            LogLine($"自定义命令结果：{(r.Success ? "成功" : "失败")} 退出码={r.ExitCode}");
-            if (!string.IsNullOrEmpty(r.Output)) LogLine("命令输出：" + r.Output.Replace(Environment.NewLine, " "));
-            if (!string.IsNullOrEmpty(r.Error)) LogLine("命令错误：" + r.Error.Replace(Environment.NewLine, " "));
+                // 输出过大时截断再回传：单条消息有 1MB 上限，超了整个结果都会被对端丢弃，
+                // 不如截断并注明，至少能看到前 10 万字符。
+                const int MaxText = 100_000;
+                string stdout = Clip(r.Output, MaxText);
+                string stderr = Clip(r.Error, MaxText);
+
+                var res = new SlaveCustomResultMsg(_sessionId)
+                {
+                    LocalMac = cmd.LocalMac,
+                    Success = r.Success,
+                    ExitCode = r.ExitCode,
+                    StdOut = stdout,
+                    StdErr = stderr
+                };
+                SendToMasterFromBg(res, adapterAlias);
+
+                SafeUi(() =>
+                {
+                    _lblStatus.Text = r.Success ? "自定义命令执行完成" : "自定义命令执行失败";
+                    LogLine($"自定义命令结果：{(r.Success ? "成功" : "失败")} 退出码={r.ExitCode}");
+                    if (!string.IsNullOrEmpty(stdout)) LogLine("命令输出：" + stdout.Replace(Environment.NewLine, " "));
+                    if (!string.IsNullOrEmpty(stderr)) LogLine("命令错误：" + stderr.Replace(Environment.NewLine, " "));
+                });
+            });
+        }
+
+        /// <summary>超长文本截断，并在末尾注明（避免对端因消息过大整条丢弃）。</summary>
+        private static string Clip(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            if (s.Length <= max) return s;
+            return s.Substring(0, max) + Environment.NewLine + $"…（输出过长，已截断，共 {s.Length} 字符）";
         }
 
         /// <summary>

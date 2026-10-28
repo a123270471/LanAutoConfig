@@ -7,16 +7,34 @@ namespace LanAutoConfig.Common
     /// </summary>
     public static class TcpLineReader
     {
-        /// <summary>单行最大字节数，超出即截断（防止恶意超长行耗尽内存）。</summary>
-        public const int MaxLineBytes = 65536;
+        /// <summary>
+        /// 单行最大字节数。原来取 64KB，但自定义命令的输出（`dir /s`、`systeminfo`、大日志 grep）
+        /// 很容易超；超了会被静默截断 → JSON 解析失败 → 接收侧只记一条“无法解析”，
+        /// 下发侧却显示“已下发成功”，非常难查。这里放宽到 1MB，并在超限时**明确报错**而不是悄悄截断。
+        /// </summary>
+        public const int MaxLineBytes = 1024 * 1024;
+
+        /// <summary>单次读取的超时（毫秒）。对端“连上但没发完就断电”时靠它兜底，否则连接会永久占着。</summary>
+        private const int ReadTimeoutMs = 15000;
 
         public static async Task<string> ReadLineAsync(NetworkStream stream)
         {
             using var ms = new MemoryStream(256);
-            var buf = new byte[4096];
+            var buf = new byte[8192];
             while (true)
             {
-                int n = await stream.ReadAsync(buf, 0, buf.Length).ConfigureAwait(false);
+                int n;
+                try
+                {
+                    // 注意：TcpClient.ReceiveTimeout 对异步 ReadAsync 无效，必须在这里自己加超时
+                    n = await stream.ReadAsync(buf, 0, buf.Length)
+                                    .WaitAsync(TimeSpan.FromMilliseconds(ReadTimeoutMs))
+                                    .ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    throw new IOException($"读取消息超时（{ReadTimeoutMs}ms 内没收到完整的一条），已放弃该连接");
+                }
                 if (n <= 0) break;                       // 对端关闭
                 int idx = Array.IndexOf(buf, (byte)'\n', 0, n);
                 if (idx >= 0)
@@ -25,7 +43,8 @@ namespace LanAutoConfig.Common
                     break;
                 }
                 ms.Write(buf, 0, n);
-                if (ms.Length > MaxLineBytes) break;
+                if (ms.Length > MaxLineBytes)
+                    throw new InvalidDataException($"单条消息超过 {MaxLineBytes / 1024}KB 上限，已丢弃（对端发的内容过大）");
             }
 
             byte[] raw = ms.ToArray();

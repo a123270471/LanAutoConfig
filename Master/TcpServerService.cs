@@ -56,7 +56,16 @@ namespace LanAutoConfig.Master
             {
                 TcpClient client;
                 try { client = await _listener.AcceptTcpClientAsync(); }
-                catch { break; }
+                catch (Exception ex)
+                {
+                    // 正常停止（Stop 里 listener.Stop()）会走到这里，不是错误
+                    if (ct.IsCancellationRequested || _listener == null) break;
+                    // 其它异常（句柄耗尽、网卡重配…）不能直接跳出：那样服务端就永久不接新连接了，
+                    // 而且日志一个字都没有，现场只会看到“被控端全部连不上”。
+                    Log?.Invoke($"[TCP 监听] 接收连接出错，稍后重试：{ex.Message}");
+                    try { await Task.Delay(500, ct); } catch { break; }
+                    continue;
+                }
                 _ = HandleAsync(client);
             }
         }

@@ -215,7 +215,7 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
         /// 以 powershell.exe -EncodedCommand 调用本地 PowerShell，捕获输出。
         /// 注意：stdout/stderr 必须并发读取，否则对端写满管道缓冲区时会互相等待造成死锁。
         /// </summary>
-        private static PsResult RunPs(string script)
+        private static PsResult RunPs(string script, int timeoutMs = 60000)
         {
             var result = new PsResult();
             try
@@ -252,11 +252,11 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
                 Task<string> outTask = p.StandardOutput.ReadToEndAsync();
                 Task<string> errTask = p.StandardError.ReadToEndAsync();
 
-                if (!p.WaitForExit(60000))
+                if (!p.WaitForExit(Math.Max(1000, timeoutMs)))
                 {
                     try { p.Kill(true); } catch { }
                     result.Success = false;
-                    result.Error = "PowerShell 执行超时（60 秒），已强制结束";
+                    result.Error = $"PowerShell 执行超时（{Math.Max(1, timeoutMs / 1000)} 秒），已强制结束";
                     return result;
                 }
 
@@ -283,12 +283,14 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
         /// shell="powershell" 走本地 PowerShell（与原改网卡逻辑同一套执行器）；
         /// 其它（如 "cmd"）走 cmd.exe /c。超时由调用方（被控端指令处理器）控制。
         /// </summary>
-        public PsResult ExecShell(string shell, string code)
+        public PsResult ExecShell(string shell, string code, int timeoutSeconds = 60)
         {
             if (string.IsNullOrWhiteSpace(code)) return Fail("命令内容为空");
+            // 控制端对话框里设的超时真正生效（之前这里写死 60 秒，设 5 秒也要等满 60 秒）
+            int timeoutMs = Math.Max(5, Math.Min(600, timeoutSeconds <= 0 ? 60 : timeoutSeconds)) * 1000;
             if (string.Equals(shell, "powershell", StringComparison.OrdinalIgnoreCase))
-                return RunPs(code);
-            return RunCmd(code);
+                return RunPs(code, timeoutMs);
+            return RunCmd(code, timeoutMs);
         }
 
         /// <summary>
@@ -299,7 +301,7 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
         /// 中文输出到控制端/被控端日志就成了乱码。现在改成读「原始字节」，
         /// 交给 <see cref="ConsoleText.Decode"/> 判定 UTF-8 还是 OEM 代码页。
         /// </summary>
-        private PsResult RunCmd(string command)
+        private PsResult RunCmd(string command, int timeoutMs = 60000)
         {
             var result = new PsResult();
             try
@@ -324,11 +326,11 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
                 Task outCopy = p.StandardOutput.BaseStream.CopyToAsync(outBuf);
                 Task errCopy = p.StandardError.BaseStream.CopyToAsync(errBuf);
 
-                if (!p.WaitForExit(60000))
+                if (!p.WaitForExit(Math.Max(1000, timeoutMs)))
                 {
                     try { p.Kill(true); } catch { }
                     result.Success = false;
-                    result.Error = "命令执行超时（60 秒），已强制结束";
+                    result.Error = $"命令执行超时（{Math.Max(1, timeoutMs / 1000)} 秒），已强制结束";
                     result.ExitCode = -1;
                     // 超时也把已产生的输出带回去，方便判断卡在哪一步
                     try { Task.WaitAll(new[] { outCopy, errCopy }, 2000); } catch { }

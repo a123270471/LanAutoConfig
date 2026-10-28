@@ -68,7 +68,14 @@ namespace LanAutoConfig.Slave
             {
                 TcpClient client;
                 try { client = await _listener.AcceptTcpClientAsync(); }
-                catch { break; }
+                catch (Exception ex)
+                {
+                    if (ct.IsCancellationRequested || _listener == null) break;   // 正常停止
+                    // 其它异常不能直接 break：否则被控端“永久失聪”，界面却一切正常、日志空白
+                    Log?.Invoke($"[TCP 监听] 接收连接出错，稍后重试：{ex.Message}");
+                    try { await Task.Delay(500, ct); } catch { break; }
+                    continue;
+                }
                 _ = HandleAsync(client);
             }
         }

@@ -86,6 +86,26 @@ namespace LanAutoConfig.Slave
 
         private void Tick()
         {
+            // 定时器回调跑在线程池上：这里任何未捕获异常都会**直接终止进程**
+            // （.NET 的行为），而界面上只会看到“程序莫名没了”。所以整个方法体必须兜住。
+            if (!_running) return;   // Stop() 之后仍可能有已排队的回调，别再发
+            try
+            {
+                DoTick();
+            }
+            catch (Exception ex)
+            {
+                LastError = ex.Message;
+                // 记一条就够，别让坏掉的网卡状态每 10 秒刷一行
+                if (System.Threading.Interlocked.CompareExchange(ref _failing, 1, 0) == 0)
+                {
+                    try { Log?.Invoke("心跳发送异常（已忽略，继续运行）：" + ex.Message); } catch { }
+                }
+            }
+        }
+
+        private void DoTick()
+        {
             string ip, sid, mac, host, localIp, alias, mask;
             lock (_lock)
             {
