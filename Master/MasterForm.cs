@@ -740,12 +740,6 @@ namespace LanAutoConfig.Master
                 BatchRebootStaggered(dlg.BatchSize, dlg.IntervalSeconds);
         }
 
-        private void ShowLabelPrintDialog()
-        {
-            using var dlg = new LabelPrintForm(this);
-            dlg.ShowDialog(this);
-        }
-
         private void BatchDeleteSelected()
         {
             var items = SelectedItems();
@@ -1824,23 +1818,19 @@ namespace LanAutoConfig.Master
             bar2.Controls.Add(btnAutostartOn);
             bar2.Controls.Add(btnAutostartOff);
 
-            // ---- 第三行：自定义命令 / 分批重启 / 验收 / 标签打印 ----
+            // ---- 第三行：自定义命令 / 分批重启 / 验收 ----
             var btnCustomCmd = new Button { Text = "自定义命令", Width = 100, Height = 32 };
             btnCustomCmd.Click += (s, e) => ShowCustomCmdDialog();
             var btnStagger = new Button { Text = "分批错峰重启", Width = 120, Height = 32 };
             btnStagger.Click += (s, e) => ShowStaggerRebootDialog();
             var btnVerify = new Button { Text = "验收选中", Width = 100, Height = 32 };
             btnVerify.Click += (s, e) => VerifySelected();
-            var btnLabel = new Button { Text = "标签打印", Width = 100, Height = 32 };
-            btnLabel.Click += (s, e) => ShowLabelPrintDialog();
             tipBar.SetToolTip(btnCustomCmd, "向选中终端（未选中则全部在线）下发 PowerShell / CMD 脚本或命令，并收回结果");
             tipBar.SetToolTip(btnStagger, "把选中终端分多批、每批间隔若干秒下发重启，避免同时重启压垮交换机/域控；上线后自动验收");
             tipBar.SetToolTip(btnVerify, "向选中终端（未选中则全部在线）下发验收指令，比对实际计算机名/IP 与期望值");
-            tipBar.SetToolTip(btnLabel, "生成资产标签（主机名/IP/MAC）网页，用浏览器打印到标签纸或 A4");
             bar2.Controls.Add(btnCustomCmd);
             bar2.Controls.Add(btnStagger);
             bar2.Controls.Add(btnVerify);
-            bar2.Controls.Add(btnLabel);
 
             _lblGridHint = new Label
             {
@@ -1860,23 +1850,13 @@ namespace LanAutoConfig.Master
                 ReadOnly = false,
                 SelectionMode = DataGridViewSelectionMode.FullRowSelect,
                 MultiSelect = true,
-                // 不用 Fill 自动填满：列会被压得很窄，错误信息/失败归类这些长内容根本看不全。
-                // 改成「固定列宽 + 双向滚动条 + 单元格折行 + 行高自适应」，
-                // 短内容一格显示完，长内容换行显示完整，列多时拖横向滚动条看。
-                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None,
-                ScrollBars = ScrollBars.Both,
-                AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.DisplayedCellsExceptHeaders,
-                ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize,
-                AllowUserToResizeColumns = true,
-                AllowUserToResizeRows = false,
+                // 紧凑排列：列宽按比例填满窗口（一屏看全，不出现横向滚动条）。
+                // 想看某列完整内容时手动拖列宽，或把鼠标停在该单元格上看提示。
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
                 RowHeadersVisible = false,
                 BackgroundColor = System.Drawing.SystemColors.Window,
                 BorderStyle = BorderStyle.FixedSingle
             };
-            _grid.DefaultCellStyle.WrapMode = DataGridViewTriState.True;
-            _grid.DefaultCellStyle.Padding = new Padding(2, 1, 2, 1);
-            // 折行后行高由内容撑开，但限制单行最高高度，避免一条超长错误信息把整屏占满
-            _grid.RowTemplate.MinimumHeight = 20;
             _grid.Columns.Add("colMac", "MAC");
             _grid.Columns.Add("colOnline", "在线");
             _grid.Columns.Add("colSrc", "来源IP");
@@ -1897,28 +1877,6 @@ namespace LanAutoConfig.Master
             foreach (DataGridViewColumn col in _grid.Columns) col.ReadOnly = true;
             _grid.Columns[cHost].ReadOnly = false;
             _grid.Columns[cIp].ReadOnly = false;
-
-            // 列宽：按内容实际长度给足（不再自动压缩），总宽超出窗口时用横向滚动条看。
-            // 长文本列（错误信息/失败归类）给宽一点并自动折行，保证整段内容能看全。
-            var colWidths = new (string Name, int Width)[]
-            {
-                ("colMac", 140), ("colOnline", 62), ("colSrc", 112), ("colSuffix", 58),
-                ("colHost", 140), ("colIp", 120), ("colMask", 116), ("colGw", 118),
-                ("colDns", 118), ("colDns2", 118), ("colMode", 78), ("colStatus", 118),
-                ("colErr", 280), ("colConf", 66), ("colVerify", 78), ("colFailCat", 200)
-            };
-            foreach (var (name, width) in colWidths)
-            {
-                var col = _grid.Columns[name];
-                if (col == null) continue;
-                col.MinimumWidth = UiScale.S(46);
-                col.Width = UiScale.S(width);
-            }
-            // 横向滚动时 MAC 固定在左侧，不然滑到右边就不知道这一行是哪台机器
-            _grid.Columns["colMac"].Frozen = true;
-            _grid.Columns["colErr"].DefaultCellStyle.WrapMode = DataGridViewTriState.True;
-            _grid.Columns["colFailCat"].DefaultCellStyle.WrapMode = DataGridViewTriState.True;
-            _grid.Columns["colMac"].DefaultCellStyle.Font = new System.Drawing.Font("Consolas", 9F);
             _grid.CellEndEdit += _grid_CellEndEdit;
             GridContextMenu();
             tab2.Controls.Add(_grid);

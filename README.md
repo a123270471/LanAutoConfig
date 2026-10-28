@@ -423,12 +423,10 @@ v3.0（资产 / 在线状态 / 白名单，本轮进行中）：
     - 命中类别如：IP 冲突（关键词 `ip address`）、执行策略禁用（`disabled by policy`/`execution policies`）、权限不足（`access is denied`）、
       找不到网卡（`cannot find interface`/`interfacealias`）、重名（`the name` + `already in use`）、DNS 解析失败、网络中断、前缀非法等；
     - 控制端 `OnResultReport` 在收到失败上报时自动归类，写进 `FailCategory`/`FailSuggestion`，网格「失败归类」列悬停可见，成功上报会清空旧归类。
-67. **资产标签打印**（`Master/LabelSheetGenerator.cs`、`Master/LabelPrintForm.cs`、`Master/MasterForm.cs`）：
-    - 机房上架要把每台机器的主机名/IP/MAC/序列号贴到机箱上，手工抄容易错；用网页排版批量生成标签更准更快；
-    - 【标签打印】对话框可选范围（选中终端 / 全部在线 / 全部）、每行标签数（2/3/4），调 `LabelSheetGenerator.GenerateHtml`
-      生成 CSS Grid 布局的 A4 标签网页（字段做了 HTML 转义防注入）；
-    - 网页写临时文件后用 `Process.Start` 交给默认浏览器打开，直接 Ctrl+P 打印即可，无需依赖 Office 或第三方库；
-    - 标签内容来自网格里各终端的「主机名 / IP / MAC / 序列号」，没有序列号的终端留空（不报错）。
+67. ~~**资产标签打印**~~ —— **已按现场要求移除**（v1.0.0 起不再提供）：
+    - 原实现为 `Master/LabelSheetGenerator.cs` + `Master/LabelPrintForm.cs`，工具条第三行的【标签打印】按钮；
+      两个源文件与按钮、`ShowLabelPrintDialog()` 入口均已删除，避免保留用不上的功能增加维护面；
+    - 标签需求可继续用「导出终端 CSV」后在 Excel/WPS 里套标签模板打印。
 68. **修复：控制端重启后“被控端全部不上线”**（`Master/Whitelist.cs`、`Master/MasterForm.cs`、`Master/WhitelistForm.cs`）：
     - **现象**：关掉控制端再启动，界面里终端记录还在，但清一色“离线”，日志每 10 秒一条
       `[白名单拒绝] 心跳 MAC=… （未在 whitelist.txt 登记）`、`已刷新终端列表：共 2 台，在线 0 台`；
@@ -476,15 +474,14 @@ v3.0（资产 / 在线状态 / 白名单，本轮进行中）：
       “被控端程序已启动，不再启动第二个。”并退出，同时写一条日志；
     - **静默模式例外**：`--silent`（开机自启触发）时只写日志、不弹窗，避免把无人值守流程卡在对话框上；
     - 互斥体申请本身出错时**放行启动**（宁可多开一个，也不能让装机流程卡死）。
-72. **终端列表：横向+纵向滚动条，单元格内容显示完整**（`Master/MasterForm.cs`）：
-    - **问题**：原用 `AutoSizeColumnsMode.Fill` 把列压缩到窗口宽度，`错误信息`/`失败归类` 这类长内容
-      只能看到开头几个字，也没有横向滚动条；
-    - **改法**：① 关闭自动填满，按内容给足列宽（MAC 140 / 错误信息 280 / 失败归类 200 等，总宽约 1900px，
-      高 DPI 下按 `UiScale.S` 放大）；② `ScrollBars = Both` 显示横纵两个滚动条；
-      ③ 单元格 `WrapMode = True` + 行高 `DisplayedCellsExceptHeaders` 自适应，长文本换行显示完整；
-      ④ `MAC` 列 `Frozen = true`，横向滑动时始终固定在最左，不会滑到右边就不知道是哪台；
-      ⑤ 错误信息 / 失败建议 / 硬件摘要都挂了 ToolTip，悬停可看完整原文；
-      ⑥ 列宽仍可手动拖动（`MinimumWidth` 46 防止拖成看不见）。
+72. **终端列表：保持紧凑排列（曾试验宽列+滚动条，已按现场要求回滚）**（`Master/MasterForm.cs`）：
+    - **过程**：曾把 `AutoSizeColumnsMode` 改成 `None` + 固定列宽 + `ScrollBars.Both` +
+      单元格折行 + 行高自适应，想让 `错误信息`/`失败归类` 显示完整；实际用起来行被折高后整屏能看的台数
+      明显变少、横向滚动反而要多拖，**现场更看重“一屏看全”**，故整体回滚；
+    - **现状**：仍是 `AutoSizeColumnsMode.Fill`（列宽按比例填满窗口、无横向滚动条、单行紧凑）；
+      想看某列完整内容时手动拖列宽（Fill 模式下拖动会重新分配比例），或把鼠标停在单元格上看提示；
+    - 唯一保留的小改进：`错误信息` 单元格挂了 ToolTip（纯悬停提示，**不改变任何排列**），
+      错误原文长到被截断时不用去翻日志。
 73. **被控端“状态与本地日志”自动换行**（`Slave/SlaveForm.cs`）：
     - **问题**：状态行用 `FlowLayoutPanel` + `AutoSize` 的 Label，文字一长就被直接裁掉（比如带 IP 的失败原因），
       日志框 `WordWrap = false`，长输出只能横向拖着看；
