@@ -58,6 +58,8 @@ namespace LanAutoConfig.Master
         private readonly System.Windows.Forms.Timer _staggerTimer = new System.Windows.Forms.Timer();
         /// <summary>每台终端的上一次“在线”状态（用于检测离线→上线跳变，触发重启后自动验收）。</summary>
         private readonly Dictionary<string, bool> _onlineState = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        /// <summary>名单拒绝日志的节流表：同一 MAC 60 秒内只记一条，避免心跳把日志刷满（曾实测一次 111KB 全是拒绝）。</summary>
+        private readonly Dictionary<string, DateTime> _rejectLogAt = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         /// <summary>打开的“自定义命令”对话框订阅此事件以接收回传结果。</summary>
         private event Action<SlaveCustomResultMsg> _customResultHandlers;
         /// <summary>分批重启待发送队列（由 _staggerTimer 逐批取出）。</summary>
@@ -149,12 +151,12 @@ namespace LanAutoConfig.Master
             }
             if (_blacklist.IsBlocked(m.LocalMac, m.LocalSourceIp))
             {
-                LogLine($"[黑名单拒绝] MAC={m.LocalMac} IP={m.LocalSourceIp}");
+                LogRejectThrottled("blk:" + m.LocalMac, $"[黑名单拒绝] MAC={m.LocalMac} IP={m.LocalSourceIp}");
                 return;
             }
             if (!_whitelist.Allows(m.LocalMac))
             {
-                LogLine($"[白名单拒绝] MAC={m.LocalMac}（未在 whitelist.txt 登记）");
+                LogRejectThrottled("wl:" + m.LocalMac, $"[白名单拒绝] MAC={m.LocalMac}（未在 whitelist.txt 登记）");
                 return;
             }
             _session.AddOrUpdate(m);
@@ -170,12 +172,12 @@ namespace LanAutoConfig.Master
             if (hb.SessionId != _session.SessionId) return;
             if (_blacklist.IsBlocked(hb.LocalMac, hb.LocalIp))
             {
-                LogLine($"[黑名单拒绝] 心跳 MAC={hb.LocalMac} IP={hb.LocalIp}");
+                LogRejectThrottled("blk:" + hb.LocalMac, $"[黑名单拒绝] 心跳 MAC={hb.LocalMac} IP={hb.LocalIp}");
                 return;
             }
             if (!_whitelist.Allows(hb.LocalMac))
             {
-                LogLine($"[白名单拒绝] 心跳 MAC={hb.LocalMac}（未在 whitelist.txt 登记）");
+                LogRejectThrottled("wl:" + hb.LocalMac, $"[白名单拒绝] 心跳 MAC={hb.LocalMac}（未在 whitelist.txt 登记）");
                 return;
             }
             if (_session.TouchHeartbeat(hb))
@@ -203,6 +205,22 @@ namespace LanAutoConfig.Master
             }
             // 记录在线状态，供后续检测“离线→上线”跳变（预留）
             _onlineState[hb.LocalMac] = true;
+        }
+
+        /// <summary>
+        /// 名单拒绝日志节流：同一 MAC 60 秒内只写一条。
+        /// 心跳每 10 秒一条、被拒绝时仍然会来，不节流会把日志刷成几千行，真正的问题反而被埋掉。
+        /// </summary>
+        private void LogRejectThrottled(string key, string text)
+        {
+            lock (_rejectLogAt)
+            {
+                if (_rejectLogAt.TryGetValue(key, out DateTime last) && (DateTime.Now - last).TotalSeconds < 60)
+                    return;
+                if (_rejectLogAt.Count > 2000) _rejectLogAt.Clear();   // 防止极端情况下无限增长
+                _rejectLogAt[key] = DateTime.Now;
+            }
+            LogLine(text);
         }
 
         // ---------- 自定义命令 / 验收 ----------
@@ -2023,6 +2041,18 @@ namespace LanAutoConfig.Master
                 UpdateStatusBar();
                 RefreshBlacklistSummary();
                 LogLine($"已恢复上次配置（会话 {ShortId(_session.SessionId)}，终端 {s.Items.Count} 台，保存于 {s.SavedAt:MM-dd HH:mm}）");
+
+                // 重启后接收服务默认没起（要点【开始发布模板】）。把这件事写在界面上，
+                // 否则用户看到“终端列表有记录但全是离线”，会误以为被控端掉线了。
+                if (s.Items.Count > 0 && !_broadcasting)
+                {
+                    _lblSession.Text = $"已恢复上次会话 {ShortId(_session.SessionId)}（{s.Items.Count} 台）；点【开始发布模板】继续";
+                    _lblBroadcast.Text = "广播: 未启动";
+                }
+
+                // 白名单：本次启动一律默认关闭（防止上次开着、这次忘了 → 全部终端被静默拒绝）
+                if (_whitelist.PersistedEnabled)
+                    LogLine("白名单上次为“启用”，本次启动已默认关闭；需要时请在【白名单…】窗口重新勾选。");
             }
             catch (Exception ex)
             {

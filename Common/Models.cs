@@ -121,7 +121,9 @@ namespace LanAutoConfig.Common
         /// <summary>从被控端上报消息填充（保留已存在项的状态与错误，状态由 SessionManager 决定）。</summary>
         public void ApplyReport(SlaveReportMsg m)
         {
-            SourceIp = m.LocalSourceIp;
+            // 优先用控制端实测到的来源 IP（TCP 连接的 remote endpoint）——它一定是可达的；
+            // 上报里的 LocalSourceIp 是发送方自己算的，断网/换地址时可能不准。
+            SourceIp = !string.IsNullOrEmpty(m.RemoteIp) ? m.RemoteIp : m.LocalSourceIp;
             Suffix = m.Suffix;
             TargetHostName = m.TargetHostName;
             TargetIp = m.TargetIp;

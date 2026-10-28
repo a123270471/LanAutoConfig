@@ -85,6 +85,9 @@ namespace LanAutoConfig.Master
                         Log?.Invoke($"[丢弃] 来自 {remoteIp} 的 {msg.MsgType} 校验失败（Magic/Check 不匹配）");
                         return;
                     }
+                    // 把“这条 TCP 连接的真实来源地址”附着到消息上：这是唯一确定可达的地址，
+                    // 控制端回发指令时以它为准（心跳/上报自带的 LocalIp 可能已过期）。
+                    msg.RemoteIp = remoteIp;
                     if (msg is SlaveReportMsg r)
                     {
                         Log?.Invoke($"收到上报：{remoteIp} MAC={r.LocalMac}");

@@ -14,6 +14,8 @@ namespace LanAutoConfig.Slave
         private readonly object _lock = new object();
         private System.Threading.Timer _timer;
         private string _masterIp, _sessionId, _mac, _hostName, _localIp;
+        /// <summary>网卡别名与掩码：用于每条心跳重新算“当前该报哪个本机地址”。</summary>
+        private string _adapterAlias, _mask;
         private volatile string _state = "idle";
         private volatile bool _running;   // 定时器是否在跑（Stop 后不要再补发）
         private int _failing;          // 连续失败次数，用于避免刷屏
@@ -23,7 +25,8 @@ namespace LanAutoConfig.Slave
         public string LastError { get; private set; }
 
         /// <summary>设置上报目标（收到新模板时调用）。</summary>
-        public void Configure(string masterIp, string sessionId, string mac, string hostName, string localIp)
+        public void Configure(string masterIp, string sessionId, string mac, string hostName, string localIp,
+            string adapterAlias = null, string mask = null)
         {
             lock (_lock)
             {
@@ -32,6 +35,8 @@ namespace LanAutoConfig.Slave
                 _mac = mac;
                 _hostName = hostName;
                 _localIp = localIp;
+                _adapterAlias = adapterAlias;
+                _mask = mask;
             }
         }
 
@@ -81,12 +86,21 @@ namespace LanAutoConfig.Slave
 
         private void Tick()
         {
-            string ip, sid, mac, host, localIp;
+            string ip, sid, mac, host, localIp, alias, mask;
             lock (_lock)
             {
                 ip = _masterIp; sid = _sessionId; mac = _mac; host = _hostName; localIp = _localIp;
+                alias = _adapterAlias; mask = _mask;
             }
             if (string.IsNullOrEmpty(ip) || string.IsNullOrEmpty(sid) || string.IsNullOrEmpty(mac)) return;
+
+            // 每条心跳都重新算一次本机地址：加了临时同网段地址、或刚执行完改 IP 之后，
+            // 原来那次 Configure 记下的地址已经过时（控制端若拿它当目标地址就会打空）。
+            if (!string.IsNullOrEmpty(alias))
+            {
+                string fresh = PickLocalIp(alias, ip, mask);
+                if (!string.IsNullOrEmpty(fresh)) localIp = fresh;
+            }
 
             var msg = new SlaveHeartbeatMsg(sid)
             {
@@ -107,6 +121,22 @@ namespace LanAutoConfig.Slave
             {
                 Log?.Invoke("心跳已恢复");
             }
+        }
+
+        /// <summary>
+        /// 从网卡现有 IPv4 中挑“最可能到得了控制端的那个”：与控制端同网段优先，否则取第一个非 APIPA。
+        /// 只用 NetworkHelper（纯 P/Invoke + 托管枚举），不碰 WinForms 控件，可在定时器线程安全调用。
+        /// </summary>
+        private static string PickLocalIp(string alias, string masterIp, string mask)
+        {
+            string first = null;
+            foreach (string a in NetworkHelper.GetIpv4List(alias))
+            {
+                if (NetworkHelper.IsApipa(a)) continue;
+                if (first == null) first = a;
+                if (!string.IsNullOrEmpty(mask) && NetworkHelper.IsSameSubnet(a, masterIp, mask)) return a;
+            }
+            return first;
         }
 
         /// <summary>轻量发送：2 秒超时、不重试、不绑定源地址。</summary>

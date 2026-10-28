@@ -143,7 +143,11 @@ namespace LanAutoConfig.Master
                     added = true;
                 }
                 it.LastSeen = DateTime.Now;
-                if (!string.IsNullOrEmpty(hb.LocalIp)) it.SourceIp = hb.LocalIp;
+                // 心跳包里的 LocalIp 是发送方在“收模板那一刻”算的，加临时地址/改 IP 后不会更新，
+                // 用它覆盖 SourceIp 会让控制端把指令发到一个已失效的地址（实测：上报来自 .9，下发却打 .5）。
+                // 因此优先用 TCP 连接的实测来源地址；没有实测值时，仅在本机还没记录过地址时兜底采用。
+                if (!string.IsNullOrEmpty(hb.RemoteIp)) it.SourceIp = hb.RemoteIp;
+                else if (string.IsNullOrEmpty(it.SourceIp) && !string.IsNullOrEmpty(hb.LocalIp)) it.SourceIp = hb.LocalIp;
                 if (string.IsNullOrEmpty(it.TargetHostName) && !string.IsNullOrEmpty(hb.HostName))
                     it.TargetHostName = hb.HostName;
             }
@@ -222,8 +226,10 @@ namespace LanAutoConfig.Master
                     it.Status = m.Success ? SlaveStatus.Success : SlaveStatus.Failed;
                     it.ErrorMsg = m.Success ? "" : (m.ErrorMsg ?? "");
                     it.DispatchTime = null;
-                    // 改完 IP 后旧地址已失效，用回传里的实际源地址刷新，后续再下发才不会打到死地址
-                    if (!string.IsNullOrEmpty(m.LocalSourceIp)) it.SourceIp = m.LocalSourceIp;
+                    // 改完 IP 后旧地址已失效，用回传里的实际源地址刷新，后续再下发才不会打到死地址。
+                    // 同样优先用实测来源地址（改 IP 后这条连接就是新地址发起的）。
+                    string observed = !string.IsNullOrEmpty(m.RemoteIp) ? m.RemoteIp : m.LocalSourceIp;
+                    if (!string.IsNullOrEmpty(observed)) it.SourceIp = observed;
                     changed = true;
                     rec = new OpLogRecord
                     {

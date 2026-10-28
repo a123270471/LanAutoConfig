@@ -159,7 +159,8 @@ namespace LanAutoConfig.Slave
             var adp = _cmbAdapter?.SelectedItem as NetworkAdapterInfo;
             if (adp == null || string.IsNullOrEmpty(adp.Mac)) return;
             string ip = NetworkHelper.GetIpv4ByAdapter(adp.Alias);
-            _hb.Configure(_masterIp, _sessionId, adp.Mac, Environment.MachineName, ip);
+            _hb.Configure(_masterIp, _sessionId, adp.Mac, Environment.MachineName, ip,
+                adp.Alias, _template?.SubnetMask);
             _hb.Start();
         }
 
@@ -313,12 +314,43 @@ namespace LanAutoConfig.Slave
                 LogLine("[拒绝] 尚未收到模板，不知道控制端地址，无法回传");
                 return false;
             }
-            string sendIp = null;
-            var adp = _cmbAdapter?.SelectedItem as NetworkAdapterInfo;
-            if (adp != null) sendIp = NetworkHelper.GetIpv4ByAdapter(adp.Alias);
+            string sendIp = ResolveReplySourceIp();
             bool ok = TcpSend.SendTo(_masterIp, AppConfig.TcpPort, msg, sendIp, out string err);
+            if (!ok && !string.IsNullOrEmpty(sendIp))
+            {
+                // 绑定源地址失败（临时地址还在 DAD 收敛、或该地址与实际路由不符）→ 退回系统自动选源再试一次
+                LogLine($"回传绑定源 {sendIp} 失败（{err}），改用系统默认源地址重试…");
+                ok = TcpSend.SendTo(_masterIp, AppConfig.TcpPort, msg, null, out err);
+            }
             if (!ok) LogLine("回传控制端失败：" + err);
             return ok;
+        }
+
+        /// <summary>
+        /// 回传控制端时该用哪个源地址：
+        /// 临时同网段地址（有过互连）&gt; 与控制端同网段的网卡地址 &gt; 网卡首个地址。
+        /// 不能无脑用 <c>GetIpv4ByAdapter</c> 的返回值 —— 它只取“第一个” IPv4，
+        /// 加了临时地址后会返回原来那个不同网段的地址，导致回传绑不上/发不出去。
+        /// </summary>
+        private string ResolveReplySourceIp()
+        {
+            var adp = _cmbAdapter?.SelectedItem as NetworkAdapterInfo;
+            if (adp == null) return null;
+            string alias = adp.Alias;
+
+            string temp = _reach.TempIp;
+            if (!string.IsNullOrEmpty(temp) && NetworkHelper.HasIpv4(alias, temp)) return temp;
+
+            string mask = _template?.SubnetMask;
+            string first = null;
+            foreach (string ip in NetworkHelper.GetIpv4List(alias))
+            {
+                if (NetworkHelper.IsApipa(ip)) continue;
+                if (first == null) first = ip;
+                if (!string.IsNullOrEmpty(mask) && !string.IsNullOrEmpty(_masterIp) &&
+                    NetworkHelper.IsSameSubnet(ip, _masterIp, mask)) return ip;
+            }
+            return first;
         }
 
         /// <summary>

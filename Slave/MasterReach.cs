@@ -36,13 +36,23 @@ namespace LanAutoConfig.Slave
             Func<string, bool> canReach, out string note)
         {
             note = null;
+            string preNote = null;
             lock (_lock)
             {
                 string current = NetworkHelper.GetIpv4ByAdapter(ifAlias);
                 if (!string.IsNullOrEmpty(current) && NetworkHelper.IsSameSubnet(current, masterIp, mask))
                 {
-                    DropTemp(); // 已经在同网段，之前的临时地址不再需要
-                    return current;
+                    // 同网段也必须用真实 TCP 握手确认，不能只看掩码就返回：
+                    // 本机地址可能和别人冲突（系统标记 Duplicate，绑定直接 AddressNotAvailable），
+                    // 或已被解绑/网线断开。此时直接返回它 → 上报必定失败，而且根本不会去加临时地址
+                    // （实测：两台被控端配了同一个 IP 时，“提交上报失败 + 临时改网卡也失败”就是这么来的）。
+                    if (canReach == null || canReach(current))
+                    {
+                        DropTemp(); // 已经在同网段且确实可达，之前的临时地址不再需要
+                        return current;
+                    }
+                    preNote = $"本机地址 {current} 与控制端 {masterIp} 同网段，但实际连不上" +
+                              "（常见原因：该 IP 与另一台机器冲突、被系统标记为重复地址），改为临时添加一个可用地址";
                 }
 
                 // 之前加的临时地址还在（没被执行脚本清掉）→ 先验证仍能连通再复用
@@ -57,10 +67,17 @@ namespace LanAutoConfig.Slave
                     DropTemp(); // 已被清除或已不通（多半是刚执行过配置），重新判断
                 }
 
-                TempIp = TryAdd(ifAlias, seed, masterIp, mask, preferIp, current, canReach, out note);
+                TempIp = TryAdd(ifAlias, seed, masterIp, mask, preferIp, current, canReach, out string err);
                 Alias = TempIp != null ? ifAlias : null;
-                if (TempIp != null && string.IsNullOrEmpty(note))
-                    note = $"控制端 {masterIp} 与本机不同网段，已临时为网卡 [{ifAlias}] 添加同网段地址 {TempIp} 用于互连（执行配置时自动清除）";
+                if (TempIp != null)
+                {
+                    string baseNote = $"已临时为网卡 [{ifAlias}] 添加同网段地址 {TempIp} 用于与控制端 {masterIp} 互连（执行配置时自动清除）";
+                    note = preNote == null ? baseNote : preNote + "；" + baseNote;
+                }
+                else
+                {
+                    note = preNote == null ? err : preNote + "；" + err;
+                }
                 return TempIp;
             }
         }
@@ -95,7 +112,7 @@ namespace LanAutoConfig.Slave
             }
 
             int start = SeedIndex(seed, MaxCandidates);
-            for (int k = 0; k < MaxCandidates && candidates.Count < 6; k++)
+            for (int k = 0; k < MaxCandidates && candidates.Count < 10; k++)
             {
                 string cand = CandidateInSubnet(masterIp, mask, ((start - 1 + k) % MaxCandidates) + 1);
                 if (cand == null) continue;
@@ -105,6 +122,14 @@ namespace LanAutoConfig.Slave
 
             foreach (string cand in candidates)
             {
+                // 绝不能拿“本机原有地址”当临时地址：它不通时下面的回滚会把这个地址从网卡上删掉，
+                // 等于把机器 IP 配置弄丢（IP 冲突时 preferIp 很可能正好等于本机当前地址）。
+                if (string.Equals(cand, currentIp, StringComparison.OrdinalIgnoreCase))
+                {
+                    error = $"候选地址 {cand} 就是本机当前地址但连不通，跳过（不动本机原有地址）";
+                    continue;
+                }
+
                 // 已经挂在网卡上就不重复添加，直接验证连通性
                 if (!NetworkHelper.HasIpv4(ifAlias, cand))
                 {
@@ -133,7 +158,9 @@ namespace LanAutoConfig.Slave
                 return null;
             }
 
-            error = $"控制端所在网段（掩码 {mask}）内没能加成功临时地址，请手动给被控端配置一个该网段地址后再试。";
+            error = $"控制端所在网段（掩码 {mask}）内没能加成功临时地址：{error}\n" +
+                    "常见原因：① 该网段可用地址都被占用；② 本机 IP 与另一台被控端重复（冲突），" +
+                    "请先改掉其中一台的编号/地址；③ 当前账户不是管理员，无法修改网卡。";
             return null;
         }
 

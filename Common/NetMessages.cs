@@ -33,6 +33,15 @@ namespace LanAutoConfig.Common
         public string Magic { get; set; } = AppConfig.Magic;
         public long Check { get; set; }
 
+        /// <summary>
+        /// 接收方观测到的“对端真实来源 IP”，由 TCP 服务端在收到消息时填入。
+        /// 不参与序列化、也不参与 Check 校验（[JsonIgnore]），只是本进程内的附加信息：
+        /// 用它作为“回发指令的目标地址”最可靠 —— 心跳/上报里带的 LocalIp 是发送方自己猜的，
+        /// 本机加了临时同网段地址后往往不会更新（历史 bug：控制端按这个旧地址下发，指令打空）。
+        /// </summary>
+        [JsonIgnore]
+        public string RemoteIp { get; set; }
+
         protected NetMessage() { }
         protected NetMessage(string msgType, string sessionId) { MsgType = msgType; SessionId = sessionId; }
 

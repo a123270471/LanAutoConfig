@@ -21,15 +21,21 @@ namespace LanAutoConfig.Master
             Load();
         }
 
-        /// <summary>是否启用白名单（启用后只放行名单里的 MAC）。</summary>
+        /// <summary>是否启用白名单（启用后只放行名单里的 MAC）。<b>每次启动都默认 false</b>。</summary>
         public bool Enabled { get; private set; }
+
+        /// <summary>上次退出时文件里记录的启用状态。仅用于提示，<b>本次启动一律不启用</b>。</summary>
+        public bool PersistedEnabled { get; private set; }
 
         public void Load()
         {
             lock (_lock)
             {
                 _macs.Clear();
+                // 安全默认：控制端每次启动都默认“不勾选白名单”。
+                // 否则上一次开了白名单、这次忘了，重启后所有终端都会被静默拒绝，表现为“被控端不上线”。
                 Enabled = false;
+                PersistedEnabled = false;
                 if (!File.Exists(_filePath)) return;
                 foreach (var line in File.ReadAllLines(_filePath))
                 {
@@ -37,7 +43,13 @@ namespace LanAutoConfig.Master
                     if (s.Length == 0) continue;
                     if (s.StartsWith("#"))
                     {
-                        if (s.IndexOf("enabled", StringComparison.OrdinalIgnoreCase) >= 0) Enabled = true;
+                        // 只认“独立的” # enabled / # disabled 标记行。
+                        // 历史 bug：之前用 s.IndexOf("enabled")>=0 判断，而文件头注释
+                        // “下面这行带 enabled 表示启用白名单”本身就含 enabled，
+                        // 导致每次启动都被误判成“已启用且名单为空”→ 拒绝全部心跳。
+                        string marker = s.TrimStart('#').Trim();
+                        if (marker.Equals("enabled", StringComparison.OrdinalIgnoreCase)) PersistedEnabled = true;
+                        else if (marker.Equals("disabled", StringComparison.OrdinalIgnoreCase)) PersistedEnabled = false;
                         continue;
                     }
                     if (Validators.IsValidMac(s)) _macs.Add(Normalize(s));
@@ -54,7 +66,7 @@ namespace LanAutoConfig.Master
                     var dir = Path.GetDirectoryName(_filePath);
                     if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
                     var sb = new StringBuilder();
-                    sb.AppendLine("# LanAutoConfig whitelist: 每行一个 MAC；下面这行带 enabled 表示启用白名单");
+                    sb.AppendLine("# LanAutoConfig whitelist: 每行一个 MAC；单独一行 # enabled 表示启用（本次启动默认不启用）");
                     sb.AppendLine(Enabled ? "# enabled" : "# disabled");
                     foreach (var m in _macs.OrderBy(x => x)) sb.AppendLine(m);
                     File.WriteAllText(_filePath, sb.ToString(), Encoding.UTF8);
