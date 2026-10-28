@@ -13,6 +13,8 @@ namespace LanAutoConfig.Master
 
         public event Action<SlaveReportMsg> OnSlaveReport;
         public event Action<SlaveResultReportMsg> OnResultReport;
+        /// <summary>收到被控端心跳（在线状态）。</summary>
+        public event Action<SlaveHeartbeatMsg> OnHeartbeat;
         public event Action<string> Log;
 
         public bool Start()
@@ -20,6 +22,10 @@ namespace LanAutoConfig.Master
             try
             {
                 _listener = new TcpListener(IPAddress.Any, AppConfig.TcpPort);
+                // 允许复用地址：上一次运行留下的 TIME_WAIT 连接（本地 48889）会让新监听 Bind 失败，
+                // 表现为“关掉控制端立刻重开就提示端口被占用”，其实并没有别的程序在监听。
+                _listener.Server.ExclusiveAddressUse = false;
+                _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
                 _listener.Start();
                 _cts = new CancellationTokenSource();
                 _ = Task.Run(() => AcceptLoop(_cts.Token));
@@ -37,6 +43,7 @@ namespace LanAutoConfig.Master
         {
             try { _cts?.Cancel(); } catch { }
             try { _listener?.Stop(); } catch { }
+            _listener = null;
         }
 
         private async Task AcceptLoop(CancellationToken ct)
@@ -83,6 +90,11 @@ namespace LanAutoConfig.Master
                     {
                         Log?.Invoke($"收到结果：{remoteIp} MAC={rr.LocalMac} 成功={rr.Success}");
                         OnResultReport?.Invoke(rr);
+                    }
+                    else if (msg is SlaveHeartbeatMsg hb)
+                    {
+                        // 心跳很频繁（每台 10 秒一条），默认不写日志，只更新在线状态
+                        OnHeartbeat?.Invoke(hb);
                     }
                 }
                 catch (Exception ex)

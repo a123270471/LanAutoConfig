@@ -1,4 +1,0 @@
-D:\ip\_build\slim-test\LanAutoConfigMaster.pdb
-D:\ip\_build\slim-test\e_sqlite3.dll
-D:\ip\_build\slim-test\LanAutoConfig.Common.pdb
-D:\ip\_build\slim-test\LanAutoConfigMaster.exe

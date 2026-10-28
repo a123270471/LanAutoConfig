@@ -7,10 +7,15 @@ namespace LanAutoConfig.Common
     public static class MsgTypes
     {
         public const string BroadcastTemplate  = "BroadcastTemplate";  // UDP广播：控制端下发模板
-        public const string SlaveReport        = "SlaveReport";        // TCP：被控端上报预览配置
+        public const string SlaveReport        = "SlaveReport";        // TCP：被控端上报预览配置（含硬件信息）
         public const string MasterExecuteCmd   = "MasterExecuteCmd";   // TCP：控制端下发最终执行配置
         public const string SlaveResultReport  = "SlaveResultReport";  // TCP：被控端上报执行结果
         public const string MasterResetSession = "MasterResetSession"; // TCP：控制端重置会话，通知终端清空本地
+        public const string SlaveHeartbeat     = "SlaveHeartbeat";     // TCP：被控端心跳（在线状态）
+        public const string MasterRebootCmd    = "MasterRebootCmd";    // TCP：控制端下发“重启本机”
+        public const string MasterAutostartCmd = "MasterAutostartCmd"; // TCP：控制端批量开关“开机自启动”
+        public const string MasterShutdownCmd  = "MasterShutdownCmd";  // TCP：控制端下发“关闭本机”
+        public const string MasterAssignSuffix = "MasterAssignSuffixCmd"; // TCP：控制端下发后缀编号，被控端自动上报
     }
 
     /// <summary>
@@ -57,16 +62,25 @@ namespace LanAutoConfig.Common
         public string Dns2 { get; set; }
         public string HostNamePrefix { get; set; }
         public bool IsDhcp { get; set; }
+        /// <summary>执行后加入的工作组（空表示不改）。</summary>
+        public string Workgroup { get; set; }
+        /// <summary>时区 ID（空表示不改），如 "China Standard Time"。</summary>
+        public string TimeZoneId { get; set; }
+        /// <summary>是否与 NTP 服务器对时。</summary>
+        public bool SyncTime { get; set; }
 
         public BroadcastTemplateMsg() : base() { }
         public BroadcastTemplateMsg(string sessionId, string ipPrefix, string mask, string gw,
-            string dns1, string dns2, string hnPrefix, bool isDhcp)
+            string dns1, string dns2, string hnPrefix, bool isDhcp,
+            string workgroup = null, string timeZoneId = null, bool syncTime = false)
             : base(MsgTypes.BroadcastTemplate, sessionId)
         {
             IpPrefix = ipPrefix; SubnetMask = mask; Gateway = gw;
             Dns1 = dns1; Dns2 = dns2; HostNamePrefix = hnPrefix; IsDhcp = isDhcp;
+            Workgroup = workgroup; TimeZoneId = timeZoneId; SyncTime = syncTime;
         }
-        protected override string StableBody() => $"{IpPrefix}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{HostNamePrefix}|{IsDhcp}";
+        protected override string StableBody()
+            => $"{IpPrefix}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{HostNamePrefix}|{IsDhcp}|{Workgroup}|{TimeZoneId}|{SyncTime}";
     }
 
     /// <summary>6.2 SlaveReport：被控端上报预览配置。</summary>
@@ -83,10 +97,13 @@ namespace LanAutoConfig.Common
         public string Dns2 { get; set; }
         /// <summary>DHCP 模式（模板勾选），必须上报给控制端，否则控制端无法区分“静态空 IP”与“DHCP”。</summary>
         public bool IsDhcp { get; set; }
+        /// <summary>硬件/资产信息（CPU/内存/磁盘/主板/BIOS/序列号）。</summary>
+        public HardwareInfo Hardware { get; set; }
 
         public SlaveReportMsg() : base() { }
         public SlaveReportMsg(string sessionId) : base(MsgTypes.SlaveReport, sessionId) { }
-        protected override string StableBody() => $"{LocalMac}|{LocalSourceIp}|{Suffix}|{TargetHostName}|{TargetIp}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{IsDhcp}";
+        protected override string StableBody()
+            => $"{LocalMac}|{LocalSourceIp}|{Suffix}|{TargetHostName}|{TargetIp}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{IsDhcp}|{Hardware?.Signature()}";
     }
 
     /// <summary>6.3 MasterExecuteCmd：控制端下发最终执行指令（被控端以此为准，覆盖本地预览值）。</summary>
@@ -101,10 +118,17 @@ namespace LanAutoConfig.Common
         public string Dns2 { get; set; }
         public bool IsDhcp { get; set; }
         public bool NeedAutoReboot { get; set; }
+        /// <summary>执行后加入的工作组（空表示不改）。</summary>
+        public string Workgroup { get; set; }
+        /// <summary>时区 ID（空表示不改）。</summary>
+        public string TimeZoneId { get; set; }
+        /// <summary>是否与 NTP 对时。</summary>
+        public bool SyncTime { get; set; }
 
         public MasterExecuteCmdMsg() : base() { }
         public MasterExecuteCmdMsg(string sessionId) : base(MsgTypes.MasterExecuteCmd, sessionId) { }
-        protected override string StableBody() => $"{LocalMac}|{TargetHostName}|{TargetIp}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{IsDhcp}|{NeedAutoReboot}";
+        protected override string StableBody()
+            => $"{LocalMac}|{TargetHostName}|{TargetIp}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{IsDhcp}|{NeedAutoReboot}|{Workgroup}|{TimeZoneId}|{SyncTime}";
     }
 
     /// <summary>6.4 SlaveResultReport：被控端回传执行结果。</summary>
@@ -129,6 +153,82 @@ namespace LanAutoConfig.Common
         public MasterResetSessionMsg() : base() { }
         public MasterResetSessionMsg(string sessionId) : base(MsgTypes.MasterResetSession, sessionId) { }
         protected override string StableBody() => "reset";
+    }
+
+    /// <summary>6.6 SlaveHeartbeat：被控端心跳（TCP，每 10 秒一次），用于控制端显示在线/离线。</summary>
+    public class SlaveHeartbeatMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        public string HostName { get; set; }
+        public string LocalIp { get; set; }
+        /// <summary>当前状态摘要（idle / reported / executing / success / failed），仅用于看板显示。</summary>
+        public string State { get; set; }
+
+        public SlaveHeartbeatMsg() : base() { }
+        public SlaveHeartbeatMsg(string sessionId) : base(MsgTypes.SlaveHeartbeat, sessionId) { }
+        protected override string StableBody() => $"{LocalMac}|{HostName}|{LocalIp}|{State}";
+    }
+
+    /// <summary>6.7 MasterRebootCmd：控制端要求某台终端重启（批量重启用）。</summary>
+    public class MasterRebootCmdMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        /// <summary>延迟秒数（给操作员留出取消/保存的时间）。</summary>
+        public int DelaySeconds { get; set; }
+
+        public MasterRebootCmdMsg() : base() { }
+        public MasterRebootCmdMsg(string sessionId) : base(MsgTypes.MasterRebootCmd, sessionId) { }
+        protected override string StableBody() => $"{LocalMac}|{DelaySeconds}";
+    }
+
+    /// <summary>
+    /// 6.8 MasterAutostartCmd：控制端要求某台终端开启 / 取消开机自启动。
+    /// 只动注册表 Run 项与本地偏好，不触碰网络配置，也不要求管理员权限（HKCU 即可）。
+    /// </summary>
+    public class MasterAutostartCmdMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        /// <summary>true = 写入开机自启；false = 删除 Run 项。</summary>
+        public bool Enable { get; set; }
+
+        public MasterAutostartCmdMsg() : base() { }
+        public MasterAutostartCmdMsg(string sessionId, string localMac, bool enable)
+            : base(MsgTypes.MasterAutostartCmd, sessionId)
+        {
+            LocalMac = localMac; Enable = enable;
+        }
+        protected override string StableBody() => $"{LocalMac}|{Enable}";
+    }
+
+    /// <summary>6.9 MasterShutdownCmd：控制端要求某台终端关机（批量关机用）。</summary>
+    public class MasterShutdownCmdMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        /// <summary>延迟秒数（给操作员留出取消/保存的时间）。</summary>
+        public int DelaySeconds { get; set; }
+
+        public MasterShutdownCmdMsg() : base() { }
+        public MasterShutdownCmdMsg(string sessionId) : base(MsgTypes.MasterShutdownCmd, sessionId) { }
+        protected override string StableBody() => $"{LocalMac}|{DelaySeconds}";
+    }
+
+    /// <summary>
+    /// 6.10 MasterAssignSuffixCmd：控制端把后缀编号直接下发到终端，终端自动填好并提交上报。
+    /// 用于「新机上电 → 控制端按上线顺序统一编号」的批量装机流程，省掉逐台手输编号。
+    /// </summary>
+    public class MasterAssignSuffixCmdMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        /// <summary>后缀编号原文（保留前导零，如 "01"）。主机名 = 前缀 + 原文，IP 末段 = 数字 + 1。</summary>
+        public string Suffix { get; set; }
+
+        public MasterAssignSuffixCmdMsg() : base() { }
+        public MasterAssignSuffixCmdMsg(string sessionId, string localMac, string suffix)
+            : base(MsgTypes.MasterAssignSuffix, sessionId)
+        {
+            LocalMac = localMac; Suffix = suffix;
+        }
+        protected override string StableBody() => $"{LocalMac}|{Suffix}";
     }
 
     /// <summary>JSON 序列化 / 反序列化助手（统一 UTF-8，PascalCase 字段与文档一致）。</summary>
@@ -162,6 +262,11 @@ namespace LanAutoConfig.Common
                     MsgTypes.MasterExecuteCmd   => JsonSerializer.Deserialize<MasterExecuteCmdMsg>(json, Opts),
                     MsgTypes.SlaveResultReport  => JsonSerializer.Deserialize<SlaveResultReportMsg>(json, Opts),
                     MsgTypes.MasterResetSession => JsonSerializer.Deserialize<MasterResetSessionMsg>(json, Opts),
+                    MsgTypes.SlaveHeartbeat     => JsonSerializer.Deserialize<SlaveHeartbeatMsg>(json, Opts),
+                    MsgTypes.MasterRebootCmd    => JsonSerializer.Deserialize<MasterRebootCmdMsg>(json, Opts),
+                    MsgTypes.MasterAutostartCmd => JsonSerializer.Deserialize<MasterAutostartCmdMsg>(json, Opts),
+                    MsgTypes.MasterShutdownCmd  => JsonSerializer.Deserialize<MasterShutdownCmdMsg>(json, Opts),
+                    MsgTypes.MasterAssignSuffix => JsonSerializer.Deserialize<MasterAssignSuffixCmdMsg>(json, Opts),
                     _ => null
                 };
                 return msg;

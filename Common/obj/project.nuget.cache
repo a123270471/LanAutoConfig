@@ -1,12 +1,12 @@
 {
   "version": 2,
-  "dgSpecHash": "DsR6V+9anMvVQJM7LwXkzYhJ6XYP4HbOSEEJK4EgokXLuVI5ZnWEpvNPm3GWym9OmrrIZyCfMpz3DXWNWZB8SA==",
+  "dgSpecHash": "Pbcbbh46Qd5zjUvQNZHp9NDwHRtiry+LWE8XM+shFKICgqFpcZk1EDn1JD9cX/1LR2Fu8c8pF6kFBqOFgm4ciQ==",
   "success": true,
   "projectFilePath": "D:\\ip\\LanAutoConfig\\Common\\Common.csproj",
   "expectedPackageFiles": [
-    "D:\\ip\\.nugetpackages\\microsoft.netcore.app.runtime.win-x64\\6.0.36\\microsoft.netcore.app.runtime.win-x64.6.0.36.nupkg.sha512",
-    "D:\\ip\\.nugetpackages\\microsoft.windowsdesktop.app.runtime.win-x64\\6.0.36\\microsoft.windowsdesktop.app.runtime.win-x64.6.0.36.nupkg.sha512",
-    "D:\\ip\\.nugetpackages\\microsoft.aspnetcore.app.runtime.win-x64\\6.0.36\\microsoft.aspnetcore.app.runtime.win-x64.6.0.36.nupkg.sha512"
+    "C:\\Users\\Administrator\\.nuget\\packages\\microsoft.netcore.app.runtime.win-x64\\6.0.36\\microsoft.netcore.app.runtime.win-x64.6.0.36.nupkg.sha512",
+    "C:\\Users\\Administrator\\.nuget\\packages\\microsoft.windowsdesktop.app.runtime.win-x64\\6.0.36\\microsoft.windowsdesktop.app.runtime.win-x64.6.0.36.nupkg.sha512",
+    "C:\\Users\\Administrator\\.nuget\\packages\\microsoft.aspnetcore.app.runtime.win-x64\\6.0.36\\microsoft.aspnetcore.app.runtime.win-x64.6.0.36.nupkg.sha512"
   ],
   "logs": []
 }

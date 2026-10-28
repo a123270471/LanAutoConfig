@@ -7,7 +7,36 @@ namespace LanAutoConfig.Common
         Executing = 1, // 已下发执行
         Success = 2,   // 成功
         Failed = 3,    // 失败
-        Skipped = 4    // 标记跳过执行
+        Skipped = 4,   // 标记跳过执行
+        Online = 5     // 只收到心跳、还没上报过（在线未上报）
+    }
+
+    /// <summary>
+    /// 被控端硬件/资产信息（批量装机后自动建资产库用）。
+    /// 字段都做成“取不到就空”，不要让某一项 WMI 失败影响整条上报。
+    /// </summary>
+    public class HardwareInfo
+    {
+        public string Cpu { get; set; }            // 型号，如 Intel(R) Core(TM) i5-10400 CPU @ 2.90GHz
+        public int CpuCores { get; set; }          // 物理核数
+        public long MemoryBytes { get; set; }      // 物理内存总量
+        public long DiskBytes { get; set; }        // 系统盘容量
+        public string DiskModel { get; set; }      // 系统盘型号
+        public string BaseBoard { get; set; }      // 主板型号
+        public string SerialNumber { get; set; }   // 整机/主板序列号（优先 BIOS 里的整机 SN）
+        public string BiosVersion { get; set; }
+        public string BiosDate { get; set; }
+        public string Manufacturer { get; set; }
+        public string Model { get; set; }
+        public string OsVersion { get; set; }
+        public string MachineName { get; set; }
+
+        public string MemoryDisplay => MemoryBytes <= 0 ? "" : (MemoryBytes / 1024d / 1024d / 1024d).ToString("0.#") + " GB";
+        public string DiskDisplay => DiskBytes <= 0 ? "" : (DiskBytes / 1024d / 1024d / 1024d).ToString("0") + " GB";
+
+        /// <summary>参与 Check 计算的稳定摘要（两端算法一致）。</summary>
+        public string Signature()
+            => $"{Cpu}|{CpuCores}|{MemoryBytes}|{DiskBytes}|{DiskModel}|{BaseBoard}|{SerialNumber}|{BiosVersion}|{BiosDate}|{Manufacturer}|{Model}|{OsVersion}|{MachineName}";
     }
 
     /// <summary>控制端内存会话实体（对应文档 7 节 SlaveSessionItem）。</summary>
@@ -31,6 +60,18 @@ namespace LanAutoConfig.Common
         /// <summary>下发执行的时刻（用于回收“执行中”卡死的记录）；未下发或已回收为 null。</summary>
         public DateTime? DispatchTime { get; set; }
 
+        /// <summary>硬件/资产信息（随上报带上来，可能为空）。</summary>
+        public HardwareInfo Hardware { get; set; }
+
+        /// <summary>最后一次收到心跳/上报的时间（本地时间）。</summary>
+        public DateTime LastSeen { get; set; } = DateTime.MinValue;
+
+        /// <summary>在线：最近一个心跳周期内收到过心跳或上报。</summary>
+        public bool Online => LastSeen != DateTime.MinValue
+                              && (DateTime.Now - LastSeen).TotalMilliseconds < AppConfig.OfflineAfterMs;
+
+        public string OnlineDisplay => Online ? "在线" : "离线";
+
         public string StatusDisplay => Status switch
         {
             SlaveStatus.Reported => "已上报待审核",
@@ -38,8 +79,25 @@ namespace LanAutoConfig.Common
             SlaveStatus.Success => "成功",
             SlaveStatus.Failed => "失败",
             SlaveStatus.Skipped => "已跳过",
+            SlaveStatus.Online => "在线未上报",
             _ => Status.ToString()
         };
+
+        /// <summary>资产摘要（列表里一列显示，详情另看）。</summary>
+        public string HardwareSummary
+        {
+            get
+            {
+                if (Hardware == null) return "";
+                string cpu = string.IsNullOrEmpty(Hardware.Cpu) ? "" : Hardware.Cpu.Split('@')[0].Trim();
+                if (cpu.Length > 34) cpu = cpu.Substring(0, 34) + "…";
+                var parts = new List<string>();
+                if (cpu.Length > 0) parts.Add(cpu);
+                if (!string.IsNullOrEmpty(Hardware.MemoryDisplay)) parts.Add("内存 " + Hardware.MemoryDisplay);
+                if (!string.IsNullOrEmpty(Hardware.DiskDisplay)) parts.Add("磁盘 " + Hardware.DiskDisplay);
+                return string.Join(" / ", parts);
+            }
+        }
 
         /// <summary>从被控端上报消息填充（保留已存在项的状态与错误，状态由 SessionManager 决定）。</summary>
         public void ApplyReport(SlaveReportMsg m)
@@ -53,6 +111,8 @@ namespace LanAutoConfig.Common
             Dns1 = m.Dns1;
             Dns2 = m.Dns2;
             IsDhcp = m.IsDhcp;
+            if (m.Hardware != null) Hardware = m.Hardware;
+            LastSeen = DateTime.Now;
         }
     }
 
@@ -66,11 +126,18 @@ namespace LanAutoConfig.Common
         public string Dns2 { get; set; }
         public string HostNamePrefix { get; set; }
         public bool IsDhcp { get; set; }
+        /// <summary>执行后要加入的工作组（空表示不改）。</summary>
+        public string Workgroup { get; set; }
+        /// <summary>时区 ID（空表示不改），如 "China Standard Time"。</summary>
+        public string TimeZoneId { get; set; }
+        /// <summary>是否与 NTP 服务器对时。</summary>
+        public bool SyncTime { get; set; }
 
         public static TemplateModel From(BroadcastTemplateMsg m) => new TemplateModel
         {
             IpPrefix = m.IpPrefix, SubnetMask = m.SubnetMask, Gateway = m.Gateway,
-            Dns1 = m.Dns1, Dns2 = m.Dns2, HostNamePrefix = m.HostNamePrefix, IsDhcp = m.IsDhcp
+            Dns1 = m.Dns1, Dns2 = m.Dns2, HostNamePrefix = m.HostNamePrefix, IsDhcp = m.IsDhcp,
+            Workgroup = m.Workgroup, TimeZoneId = m.TimeZoneId, SyncTime = m.SyncTime
         };
     }
 

@@ -23,6 +23,18 @@ namespace LanAutoConfig.Master
             Changed?.Invoke();
         }
 
+        /// <summary>从持久化配置恢复会话（重启程序后终端列表还在）。</summary>
+        public void Restore(string sessionId, IEnumerable<SlaveSessionItem> items)
+        {
+            lock (_lock)
+            {
+                if (!string.IsNullOrEmpty(sessionId)) SessionId = sessionId;
+                Items.Clear();
+                if (items != null) Items.AddRange(items);
+            }
+            Changed?.Invoke();
+        }
+
         /// <summary>
         /// 新增或更新一条上报记录（同一 MAC 去重更新）。
         /// 任何一次重新上报都视为“重新进入待审核”，状态复位为 Reported，允许再次下发。
@@ -59,10 +71,89 @@ namespace LanAutoConfig.Master
             Changed?.Invoke();
         }
 
+        /// <summary>批量删除（只触发一次刷新）。</summary>
+        public void RemoveMany(IEnumerable<string> macs)
+        {
+            var set = new HashSet<string>(macs ?? Enumerable.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+            if (set.Count == 0) return;
+            lock (_lock) Items.RemoveAll(x => set.Contains(x.Mac));
+            Changed?.Invoke();
+        }
+
+        /// <summary>批量标记跳过 / 取消跳过（只触发一次刷新）。</summary>
+        public void SetSkipMany(IEnumerable<string> macs, bool skip)
+        {
+            var set = new HashSet<string>(macs ?? Enumerable.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+            if (set.Count == 0) return;
+            lock (_lock)
+            {
+                foreach (var it in Items)
+                {
+                    if (!set.Contains(it.Mac)) continue;
+                    it.Skip = skip;
+                    it.Status = skip ? SlaveStatus.Skipped : SlaveStatus.Reported;
+                    it.DispatchTime = null;
+                    if (!skip) it.ErrorMsg = "";
+                }
+            }
+            Changed?.Invoke();
+        }
+
+        /// <summary>
+        /// IP 池分配：取一个没被别的终端占用的后缀（1..254）。
+        /// forMac 对应的终端自身的后缀不算“占用”，这样重复上报不会一直换号。
+        /// </summary>
+        public int NextFreeSuffix(string forMac)
+        {
+            lock (_lock)
+            {
+                var used = new HashSet<int>();
+                foreach (var it in Items)
+                {
+                    if (!string.IsNullOrEmpty(forMac) &&
+                        string.Equals(it.Mac, forMac, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (int.TryParse(it.Suffix, out int n)) used.Add(n);
+                }
+                for (int n = 1; n < 255; n++) if (!used.Contains(n)) return n;
+                return -1;
+            }
+        }
+
         public SlaveSessionItem GetByMac(string mac)
         {
             lock (_lock)
                 return Items.FirstOrDefault(x => string.Equals(x.Mac, mac, StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>
+        /// 收到心跳：刷新在线时间；名单里没有的 MAC 就以“在线未上报”建一条（只在第一次建行时返回 true）。
+        /// 心跳很频繁，调用方只在返回 true（列表结构变了）时才整表刷新，其余情况只刷在线列。
+        /// </summary>
+        public bool TouchHeartbeat(SlaveHeartbeatMsg hb)
+        {
+            bool added = false;
+            lock (_lock)
+            {
+                if (hb.SessionId != SessionId) return false;
+                var it = Items.FirstOrDefault(x => string.Equals(x.Mac, hb.LocalMac, StringComparison.OrdinalIgnoreCase));
+                if (it == null)
+                {
+                    it = new SlaveSessionItem { Mac = hb.LocalMac, Status = SlaveStatus.Online, Skip = true };
+                    Items.Add(it);
+                    added = true;
+                }
+                it.LastSeen = DateTime.Now;
+                if (!string.IsNullOrEmpty(hb.LocalIp)) it.SourceIp = hb.LocalIp;
+                if (string.IsNullOrEmpty(it.TargetHostName) && !string.IsNullOrEmpty(hb.HostName))
+                    it.TargetHostName = hb.HostName;
+            }
+            return added;
+        }
+
+        /// <summary>在线台数（心跳/上报在 30 秒内）。</summary>
+        public int OnlineCount
+        {
+            get { lock (_lock) return Items.Count(x => x.Online); }
         }
 
         public void MarkSkip(string mac)

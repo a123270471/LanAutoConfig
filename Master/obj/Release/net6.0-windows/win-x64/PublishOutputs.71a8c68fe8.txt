@@ -1,3 +1,0 @@
-D:\ip\_fdtest\LanAutoConfigMaster.pdb
-D:\ip\_fdtest\LanAutoConfig.Common.pdb
-D:\ip\_fdtest\LanAutoConfigMaster.exe

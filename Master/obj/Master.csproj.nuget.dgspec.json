@@ -10,7 +10,7 @@
         "projectUniqueName": "D:\\ip\\LanAutoConfig\\Common\\Common.csproj",
         "projectName": "LanAutoConfig.Common",
         "projectPath": "D:\\ip\\LanAutoConfig\\Common\\Common.csproj",
-        "packagesPath": "D:\\ip\\.nugetpackages",
+        "packagesPath": "C:\\Users\\Administrator\\.nuget\\packages\\",
         "outputPath": "D:\\ip\\LanAutoConfig\\Common\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
@@ -70,7 +70,7 @@
               "privateAssets": "none"
             }
           },
-          "runtimeIdentifierGraphPath": "D:\\ip\\.dotnet\\sdk\\6.0.428\\RuntimeIdentifierGraph.json"
+          "runtimeIdentifierGraphPath": "D:\\ip\\.dotnet\\sdk6\\sdk\\6.0.428\\RuntimeIdentifierGraph.json"
         }
       },
       "runtimes": {
@@ -85,7 +85,7 @@
         "projectUniqueName": "D:\\ip\\LanAutoConfig\\Master\\Master.csproj",
         "projectName": "LanAutoConfigMaster",
         "projectPath": "D:\\ip\\LanAutoConfig\\Master\\Master.csproj",
-        "packagesPath": "D:\\ip\\.nugetpackages",
+        "packagesPath": "C:\\Users\\Administrator\\.nuget\\packages\\",
         "outputPath": "D:\\ip\\LanAutoConfig\\Master\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
@@ -155,7 +155,7 @@
               "privateAssets": "none"
             }
           },
-          "runtimeIdentifierGraphPath": "D:\\ip\\.dotnet\\sdk\\6.0.428\\RuntimeIdentifierGraph.json"
+          "runtimeIdentifierGraphPath": "D:\\ip\\.dotnet\\sdk6\\sdk\\6.0.428\\RuntimeIdentifierGraph.json"
         }
       },
       "runtimes": {

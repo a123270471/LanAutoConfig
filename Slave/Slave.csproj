@@ -38,6 +38,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Common\Common.csproj" />
+    <!-- 硬件/资产信息采集：Win32_* WMI 查询（只在被控端用） -->
+    <PackageReference Include="System.Management" Version="6.0.0" />
   </ItemGroup>
 
 </Project>

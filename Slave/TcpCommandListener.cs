@@ -15,6 +15,14 @@ namespace LanAutoConfig.Slave
         public event Action<MasterExecuteCmdMsg> OnExecute;
         /// <summary>收到会话重置。</summary>
         public event Action OnReset;
+        /// <summary>收到“重启本机”指令（批量重启用）。</summary>
+        public event Action<MasterRebootCmdMsg> OnReboot;
+        /// <summary>收到“开关开机自启动”指令（批量运维用）。</summary>
+        public event Action<MasterAutostartCmdMsg> OnAutostart;
+        /// <summary>收到“关闭本机”指令（批量关机用）。</summary>
+        public event Action<MasterShutdownCmdMsg> OnShutdown;
+        /// <summary>收到“分配后缀编号”指令（批量装机用，收到后自动填编号并上报）。</summary>
+        public event Action<MasterAssignSuffixCmdMsg> OnAssignSuffix;
         public event Action<string> Log;
 
         public void SetSessionId(string sid) => _currentSessionId = sid ?? "";
@@ -27,6 +35,8 @@ namespace LanAutoConfig.Slave
         {
             try
             {
+                // 这里刻意不加 SO_REUSEADDR：Windows 上两个套接字都设了它时，后绑定的会“抢走”同一端口的连接，
+                // 同机再开一个被控端就会把控制端下发的指令抢走。绑定失败按“已有实例在跑”处理更安全。
                 _listener = new TcpListener(IPAddress.Any, AppConfig.TcpPort);
                 _listener.Start();
                 _cts = new CancellationTokenSource();
@@ -45,6 +55,7 @@ namespace LanAutoConfig.Slave
         {
             try { _cts?.Cancel(); } catch { }
             try { _listener?.Stop(); } catch { }
+            _listener = null;
         }
 
         private async Task AcceptLoop(CancellationToken ct)
@@ -108,6 +119,26 @@ namespace LanAutoConfig.Slave
                     {
                         Log?.Invoke("收到控制端会话重置指令");
                         OnReset?.Invoke();
+                    }
+                    else if (msg is MasterRebootCmdMsg rb && rb.SessionId == sid)
+                    {
+                        Log?.Invoke($"收到控制端重启指令（延迟 {rb.DelaySeconds} 秒）");
+                        OnReboot?.Invoke(rb);
+                    }
+                    else if (msg is MasterAutostartCmdMsg ac && ac.SessionId == sid)
+                    {
+                        Log?.Invoke($"收到控制端开机自启指令：{(ac.Enable ? "开启" : "取消")} MAC={ac.LocalMac}");
+                        OnAutostart?.Invoke(ac);
+                    }
+                    else if (msg is MasterShutdownCmdMsg sd && sd.SessionId == sid)
+                    {
+                        Log?.Invoke($"收到控制端关机指令（延迟 {sd.DelaySeconds} 秒）");
+                        OnShutdown?.Invoke(sd);
+                    }
+                    else if (msg is MasterAssignSuffixCmdMsg asg && asg.SessionId == sid)
+                    {
+                        Log?.Invoke($"收到控制端编号指令：后缀 {asg.Suffix} MAC={asg.LocalMac}");
+                        OnAssignSuffix?.Invoke(asg);
                     }
                     else
                     {

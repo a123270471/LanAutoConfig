@@ -1,0 +1,145 @@
+using LanAutoConfig.Common;
+
+namespace LanAutoConfig.Slave
+{
+    /// <summary>
+    /// 被控端心跳：收到控制端模板后，每 <see cref="AppConfig.HeartbeatIntervalMs"/> 毫秒
+    /// 给控制端发一条 SlaveHeartbeat，用于控制端显示在线/离线与执行进度。
+    ///
+    /// 这里刻意不复用 TcpSend（它有 5 秒超时 + 重试，心跳不需要这么重），
+    /// 单独用 2 秒超时的轻量发送，失败只记一次日志，不堆积连接。
+    /// </summary>
+    public class HeartbeatService : IDisposable
+    {
+        private readonly object _lock = new object();
+        private System.Threading.Timer _timer;
+        private string _masterIp, _sessionId, _mac, _hostName, _localIp;
+        private volatile string _state = "idle";
+        private volatile bool _running;   // 定时器是否在跑（Stop 后不要再补发）
+        private int _failing;          // 连续失败次数，用于避免刷屏
+
+        public event Action<string> Log;
+
+        public string LastError { get; private set; }
+
+        /// <summary>设置上报目标（收到新模板时调用）。</summary>
+        public void Configure(string masterIp, string sessionId, string mac, string hostName, string localIp)
+        {
+            lock (_lock)
+            {
+                _masterIp = masterIp;
+                _sessionId = sessionId;
+                _mac = mac;
+                _hostName = hostName;
+                _localIp = localIp;
+            }
+        }
+
+        /// <summary>
+        /// 状态变化（已上报 / 执行中 / 成功 / 失败）立刻补推一次心跳，
+        /// 不再等下一个 10 秒周期，否则控制端的进度看板会明显滞后。
+        /// </summary>
+        public void SetState(string state)
+        {
+            string s = string.IsNullOrEmpty(state) ? "idle" : state;
+            if (string.Equals(_state, s, StringComparison.Ordinal)) return;
+            _state = s;
+            if (_running) Task.Run(() => Tick());
+        }
+
+        /// <summary>
+        /// 启动心跳。<b>第一条立即发</b>（dueTime = 0）—— 首位触发时间决定控制端多久能看到这台机“上线”，
+        /// 若按周期等，被控端要过整整一个心跳周期（10 秒）才会被控制端发现。
+        /// 重复调用（换网卡、换会话、控制端重发模板）会把计时器重置成立即触发，保证新目标马上生效。
+        /// </summary>
+        public void Start()
+        {
+            lock (_lock)
+            {
+                if (_timer == null)
+                {
+                    _running = true;
+                    _timer = new System.Threading.Timer(_ => Tick(), null, 0, AppConfig.HeartbeatIntervalMs);
+                }
+                else
+                {
+                    _running = true;
+                    try { _timer.Change(0, AppConfig.HeartbeatIntervalMs); } catch { }
+                }
+            }
+        }
+
+        public void Stop()
+        {
+            lock (_lock)
+            {
+                _running = false;
+                _timer?.Dispose();
+                _timer = null;
+            }
+        }
+
+        private void Tick()
+        {
+            string ip, sid, mac, host, localIp;
+            lock (_lock)
+            {
+                ip = _masterIp; sid = _sessionId; mac = _mac; host = _hostName; localIp = _localIp;
+            }
+            if (string.IsNullOrEmpty(ip) || string.IsNullOrEmpty(sid) || string.IsNullOrEmpty(mac)) return;
+
+            var msg = new SlaveHeartbeatMsg(sid)
+            {
+                LocalMac = mac,
+                HostName = host,
+                LocalIp = localIp,
+                State = _state
+            };
+            bool ok = SendLight(ip, AppConfig.TcpPort, msg, out string err);
+            LastError = ok ? null : err;
+            if (!ok)
+            {
+                // 只在“从正常变成失败”时记一条，避免 10 秒一条刷满日志
+                if (System.Threading.Interlocked.CompareExchange(ref _failing, 1, 0) == 0)
+                    Log?.Invoke($"心跳发送失败（{ip}）：{err}");
+            }
+            else if (System.Threading.Interlocked.Exchange(ref _failing, 0) == 1)
+            {
+                Log?.Invoke("心跳已恢复");
+            }
+        }
+
+        /// <summary>轻量发送：2 秒超时、不重试、不绑定源地址。</summary>
+        private static bool SendLight(string ip, int port, NetMessage msg, out string error)
+        {
+            error = null;
+            if (!IPAddress.TryParse(ip, out IPAddress dest)) { error = "目标 IP 不合法"; return false; }
+            TcpClient client = null;
+            try
+            {
+                client = new TcpClient();
+                Task connect = client.ConnectAsync(dest, port);
+                if (!connect.Wait(2000)) { try { client.Close(); } catch { } error = "连接超时"; return false; }
+                connect.GetAwaiter().GetResult();
+
+                string json = JsonHelper.Serialize(msg);
+                byte[] bytes = Encoding.UTF8.GetBytes(json + "\n");
+                var stream = client.GetStream();
+                stream.Write(bytes, 0, bytes.Length);
+                stream.Flush();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+            finally
+            {
+                try { client?.Close(); } catch { }
+            }
+        }
+
+        public void Dispose() => Stop();
+    }
+}

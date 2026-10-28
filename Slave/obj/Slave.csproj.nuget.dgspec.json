@@ -10,7 +10,7 @@
         "projectUniqueName": "D:\\ip\\LanAutoConfig\\Common\\Common.csproj",
         "projectName": "LanAutoConfig.Common",
         "projectPath": "D:\\ip\\LanAutoConfig\\Common\\Common.csproj",
-        "packagesPath": "D:\\ip\\.nugetpackages",
+        "packagesPath": "C:\\Users\\Administrator\\.nuget\\packages\\",
         "outputPath": "D:\\ip\\LanAutoConfig\\Common\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
@@ -70,7 +70,7 @@
               "privateAssets": "none"
             }
           },
-          "runtimeIdentifierGraphPath": "D:\\ip\\.dotnet\\sdk\\6.0.428\\RuntimeIdentifierGraph.json"
+          "runtimeIdentifierGraphPath": "D:\\ip\\.dotnet\\sdk6\\sdk\\6.0.428\\RuntimeIdentifierGraph.json"
         }
       },
       "runtimes": {
@@ -85,7 +85,7 @@
         "projectUniqueName": "D:\\ip\\LanAutoConfig\\Slave\\Slave.csproj",
         "projectName": "LanAutoConfigSlave",
         "projectPath": "D:\\ip\\LanAutoConfig\\Slave\\Slave.csproj",
-        "packagesPath": "D:\\ip\\.nugetpackages",
+        "packagesPath": "C:\\Users\\Administrator\\.nuget\\packages\\",
         "outputPath": "D:\\ip\\LanAutoConfig\\Slave\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
@@ -116,6 +116,12 @@
       "frameworks": {
         "net6.0-windows7.0": {
           "targetAlias": "net6.0-windows",
+          "dependencies": {
+            "System.Management": {
+              "target": "Package",
+              "version": "[6.0.0, )"
+            }
+          },
           "imports": [
             "net461",
             "net462",
@@ -149,7 +155,7 @@
               "privateAssets": "none"
             }
           },
-          "runtimeIdentifierGraphPath": "D:\\ip\\.dotnet\\sdk\\6.0.428\\RuntimeIdentifierGraph.json"
+          "runtimeIdentifierGraphPath": "D:\\ip\\.dotnet\\sdk6\\sdk\\6.0.428\\RuntimeIdentifierGraph.json"
         }
       },
       "runtimes": {

@@ -452,7 +452,7 @@
     ]
   },
   "packageFolders": {
-    "D:\\ip\\.nugetpackages": {}
+    "C:\\Users\\Administrator\\.nuget\\packages\\": {}
   },
   "project": {
     "version": "1.0.0",
@@ -460,7 +460,7 @@
       "projectUniqueName": "D:\\ip\\LanAutoConfig\\Master\\Master.csproj",
       "projectName": "LanAutoConfigMaster",
       "projectPath": "D:\\ip\\LanAutoConfig\\Master\\Master.csproj",
-      "packagesPath": "D:\\ip\\.nugetpackages",
+      "packagesPath": "C:\\Users\\Administrator\\.nuget\\packages\\",
       "outputPath": "D:\\ip\\LanAutoConfig\\Master\\obj\\",
       "projectStyle": "PackageReference",
       "configFilePaths": [
@@ -530,7 +530,7 @@
             "privateAssets": "none"
           }
         },
-        "runtimeIdentifierGraphPath": "D:\\ip\\.dotnet\\sdk\\6.0.428\\RuntimeIdentifierGraph.json"
+        "runtimeIdentifierGraphPath": "D:\\ip\\.dotnet\\sdk6\\sdk\\6.0.428\\RuntimeIdentifierGraph.json"
       }
     },
     "runtimes": {

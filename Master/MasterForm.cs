@@ -13,20 +13,23 @@ namespace LanAutoConfig.Master
         private readonly SqliteLogStore _db;
         private readonly TextLogger _logger;
         private readonly Blacklist _blacklist;
+        private readonly Whitelist _whitelist;
         private readonly UdpBroadcastService _broadcast = new UdpBroadcastService();
         private readonly TcpServerService _server = new TcpServerService();
         private readonly System.Windows.Forms.Timer _sweepTimer = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer _onlineTimer = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer _saveTimer = new System.Windows.Forms.Timer();
 
         private TabControl _tabs;
         private StatusStrip _status;
-        private ToolStripStatusLabel _lblReported, _lblPending, _lblSuccess, _lblFailed, _lblConflict, _lblBroadcast;
+        private ToolStripStatusLabel _lblReported, _lblPending, _lblSuccess, _lblFailed, _lblConflict, _lblBroadcast, _lblOnline;
 
         // Tab1 模板配置
         private TabPage _tabTemplates;
         private TextBox _txtIpPrefix, _txtMask, _txtGw, _txtDns1, _txtDns2, _txtHnPrefix;
         private Label _lblBlacklist, _lblDhcpPool;
         private CheckBox _chkDhcp, _chkDhcpServer;
-        private Button _btnStart, _btnStop, _btnReset, _btnManageBlacklist;
+        private Button _btnStart, _btnStop, _btnReset, _btnManageBlacklist, _btnWhitelist;
         private Label _lblSession;
         private ComboBox _cmbAdapter;
 
@@ -62,25 +65,48 @@ namespace LanAutoConfig.Master
             Directory.CreateDirectory(AppConfig.LogDir);
             _db = new SqliteLogStore(AppConfig.MasterDbPath);
             _blacklist = new Blacklist(AppConfig.BlacklistPath);
+            _whitelist = new Whitelist(AppConfig.WhitelistPath);
             _logger = new TextLogger(Path.Combine(AppConfig.LogDir, "master.log"));
             _session.NewSession(); // 初始化一个会话 ID
 
             BuildUi();
             LoadBroadcastAdapters();
-            _session.Changed += () => SafeUi(() => { RefreshGrid(); UpdateStatusBar(); });
+            LoadSettings();   // 恢复上次的模板参数、会话与终端列表（重启不丢）
+
+            // 模板参数改动也做合并保存（3 秒节流）
+            foreach (var tb in new[] { _txtIpPrefix, _txtMask, _txtGw, _txtDns1, _txtDns2, _txtHnPrefix })
+                tb.TextChanged += (s2, e2) => ScheduleSave();
+            _chkDhcp.CheckedChanged += (s2, e2) => ScheduleSave();
+            _chkDhcpServer.CheckedChanged += (s2, e2) => ScheduleSave();
+            _cmbAdapter.SelectedIndexChanged += (s2, e2) => ScheduleSave();
+
+            _session.Changed += () => SafeUi(() => { RefreshGrid(); UpdateStatusBar(); ScheduleSave(); });
             _broadcast.Log += m => SafeUi(() => LogLine(m));
             _server.Log += m => SafeUi(() => LogLine(m));
             _server.OnSlaveReport += r => SafeUi(() => OnSlaveReport(r));
             _server.OnResultReport += r => SafeUi(() => OnResultReport(r));
+            _server.OnHeartbeat += r => SafeUi(() => OnHeartbeat(r));
+
+            // 单独的心跳刷新定时器：只重画“在线”列与状态栏，不整表刷新（否则每 10 秒闪一次、还打断编辑）
+            _onlineTimer.Interval = 5000;
+            _onlineTimer.Tick += (s, e) => { RefreshOnlineCells(); UpdateStatusBar(); };
+            _onlineTimer.Start();
 
             // 定时回收“执行中但一直没结果”的终端，避免永远卡在执行中
             _sweepTimer.Interval = SweepIntervalMs;
             _sweepTimer.Tick += (s, e) => SweepStaleExecuting();
             _sweepTimer.Start();
 
+            // 配置/终端列表落盘：改动后 3 秒合并写一次，退出时再写一次
+            _saveTimer.Interval = 3000;
+            _saveTimer.Tick += (s, e) => { _saveTimer.Stop(); SaveSettings(); };
+
             FormClosing += (s, e) =>
             {
                 try { _sweepTimer.Stop(); } catch { }
+                try { _onlineTimer.Stop(); } catch { }
+                try { _saveTimer.Stop(); } catch { }
+                SaveSettings();   // 退出前把模板参数与终端列表记下来
                 _broadcast.Stop();
                 _server.Stop();
                 _dhcp.Stop();
@@ -104,8 +130,64 @@ namespace LanAutoConfig.Master
                 LogLine($"[黑名单拒绝] MAC={m.LocalMac} IP={m.LocalSourceIp}");
                 return;
             }
+            if (!_whitelist.Allows(m.LocalMac))
+            {
+                LogLine($"[白名单拒绝] MAC={m.LocalMac}（未在 whitelist.txt 登记）");
+                return;
+            }
             _session.AddOrUpdate(m);
             LogLine($"新增/更新终端：{m.TargetHostName} @ {(m.IsDhcp ? "DHCP" : m.TargetIp)}（MAC={m.LocalMac} 来源={m.LocalSourceIp}）");
+            var hw = m.Hardware;
+            if (hw != null)
+                LogLine($"资产信息：{hw.Cpu} / 内存 {hw.MemoryDisplay} / 磁盘 {hw.DiskDisplay} / SN {hw.SerialNumber} / {hw.Manufacturer} {hw.Model}");
+        }
+
+        /// <summary>收到心跳：刷新在线时间；第一次见到的 MAC 建一行“在线未上报”。</summary>
+        private void OnHeartbeat(SlaveHeartbeatMsg hb)
+        {
+            if (hb.SessionId != _session.SessionId) return;
+            if (_blacklist.IsBlocked(hb.LocalMac, hb.LocalIp))
+            {
+                LogLine($"[黑名单拒绝] 心跳 MAC={hb.LocalMac} IP={hb.LocalIp}");
+                return;
+            }
+            if (!_whitelist.Allows(hb.LocalMac))
+            {
+                LogLine($"[白名单拒绝] 心跳 MAC={hb.LocalMac}（未在 whitelist.txt 登记）");
+                return;
+            }
+            if (_session.TouchHeartbeat(hb))
+            {
+                LogLine($"发现新终端（仅心跳）：MAC={hb.LocalMac} IP={hb.LocalIp} 主机名={hb.HostName}");
+                RefreshGrid();
+            }
+            else
+            {
+                // 已有行：立刻把「在线」格刷出来。整表刷新会打断选择/编辑，只改这一格；
+                // 不这么做就要等 5 秒的心跳刷新定时器，明明已经在线却显示“离线”。
+                UpdateOnlineCell(hb.LocalMac);
+                UpdateStatusBar();
+            }
+        }
+
+        /// <summary>只刷某台终端的「在线」单元格（收到心跳时立即调用）。</summary>
+        private void UpdateOnlineCell(string mac)
+        {
+            if (_grid == null || _grid.IsDisposed) return;
+            int col = _grid.Columns["colOnline"]?.Index ?? -1;
+            if (col < 0) return;
+            string norm = NetworkHelper.NormalizeMac(mac);
+            foreach (DataGridViewRow row in _grid.Rows)
+            {
+                if (row.Tag is not SlaveSessionItem it) continue;
+                if (!string.Equals(NetworkHelper.NormalizeMac(it.Mac), norm, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!string.Equals(row.Cells[col].Value as string, it.OnlineDisplay, StringComparison.Ordinal))
+                {
+                    row.Cells[col].Value = it.OnlineDisplay;
+                    row.Cells[col].Style.ForeColor = it.Online ? System.Drawing.Color.Green : System.Drawing.Color.Gray;
+                }
+                break;
+            }
         }
 
         private void OnResultReport(SlaveResultReportMsg m)
@@ -156,7 +238,10 @@ namespace LanAutoConfig.Master
             var t = BuildTemplateFromUi();
             if (t == null) return;
 
-            _session.NewSession();
+            // 重启后继续上一批次：模板参数和终端列表已经恢复，这里不要换会话，
+            // 否则恢复出来的终端立刻变成“上一批次遗留”而被丢弃。要开新批次请点【重置会话】。
+            if (string.IsNullOrEmpty(_session.SessionId) || _session.Items.Count == 0)
+                _session.NewSession();
             string bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
             if (string.IsNullOrEmpty(bindIp))
             {
@@ -371,6 +456,9 @@ namespace LanAutoConfig.Master
                 if (it != null && MessageBox.Show($"删除 {it.TargetHostName}？", "确认", MessageBoxButtons.OKCancel) == DialogResult.OK)
                     _session.Remove(it.Mac);
             });
+            menu.Items.Add("批量删除选中", null, (s, e) => BatchDeleteSelected());
+            menu.Items.Add("批量标记跳过", null, (s, e) => BatchSkipSelected(true));
+            menu.Items.Add("批量取消跳过", null, (s, e) => BatchSkipSelected(false));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("加入黑名单（MAC）", null, (s, e) =>
             {
@@ -397,6 +485,479 @@ namespace LanAutoConfig.Master
             return _grid.CurrentRow.Tag as SlaveSessionItem;
         }
 
+        /// <summary>手动刷新终端列表：重读会话数据、重算冲突与在线状态、刷新状态栏和名单摘要。</summary>
+        private void RefreshTerminalList()
+        {
+            RefreshGrid();
+            RefreshOnlineCells();
+            UpdateStatusBar();
+            RefreshBlacklistSummary();
+            int online = _session.Items.Count(x => x.Online);
+            LogLine($"已刷新终端列表：共 {_session.Items.Count} 台，在线 {online} 台");
+        }
+
+        /// <summary>当前选中的终端（多选）。</summary>
+        private List<SlaveSessionItem> SelectedItems()
+        {
+            var list = new List<SlaveSessionItem>();
+            foreach (DataGridViewRow row in _grid.SelectedRows)
+                if (row.Tag is SlaveSessionItem it) list.Add(it);
+            return list;
+        }
+
+        private void BatchDeleteSelected()
+        {
+            var items = SelectedItems();
+            if (items.Count == 0) { MessageBox.Show("请先选中要删除的终端（Ctrl/Shift 多选）。", "提示"); return; }
+            if (MessageBox.Show($"确认删除选中的 {items.Count} 台终端？", "确认",
+                    MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            _session.RemoveMany(items.Select(x => x.Mac));
+            LogLine($"已批量删除 {items.Count} 台终端");
+        }
+
+        private void BatchSkipSelected(bool skip)
+        {
+            var items = SelectedItems();
+            if (items.Count == 0) { MessageBox.Show("请先选中终端（Ctrl/Shift 多选）。", "提示"); return; }
+            _session.SetSkipMany(items.Select(x => x.Mac), skip);
+            LogLine($"已批量{(skip ? "标记跳过" : "取消跳过")} {items.Count} 台终端");
+        }
+
+        /// <summary>按后缀区间筛选（支持 "10"、"10-20"、"，"分隔的多个区间）。</summary>
+        private void FilterBySuffix()
+        {
+            string input = Prompt("按后缀区间筛选", "输入后缀区间，例如 10-20 或 5,8,12-15：");
+            if (string.IsNullOrWhiteSpace(input)) return;
+            var ranges = new List<(int lo, int hi)>();
+            foreach (var part in input.Split(new[] { ',', '，', ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var seg = part.Trim();
+                int dash = seg.IndexOf('-');
+                if (dash > 0 && int.TryParse(seg.Substring(0, dash), out int lo) && int.TryParse(seg.Substring(dash + 1), out int hi))
+                    ranges.Add((Math.Min(lo, hi), Math.Max(lo, hi)));
+                else if (int.TryParse(seg, out int one)) ranges.Add((one, one));
+            }
+            if (ranges.Count == 0) { MessageBox.Show("格式不对，示例：10-20 或 5,8,12-15"); return; }
+
+            _grid.ClearSelection();
+            int hit = 0;
+            foreach (DataGridViewRow row in _grid.Rows)
+            {
+                if (row.Tag is not SlaveSessionItem it) continue;
+                if (!int.TryParse(it.Suffix, out int n)) continue;
+                if (!ranges.Any(r => n >= r.lo && n <= r.hi)) continue;
+                row.Selected = true;
+                hit++;
+            }
+            LogLine($"按后缀区间 [{input}] 筛出 {hit} 台终端");
+            if (hit == 0) MessageBox.Show("没有匹配的终端。", "筛选");
+        }
+
+        /// <summary>导出资产台账（CSV）：批量装机后直接当资产库用。</summary>
+        private void ExportAssetsCsv()
+        {
+            var items = _session.Items.ToList();
+            if (items.Count == 0) { MessageBox.Show("终端列表为空，没有可导出的资产。", "提示"); return; }
+            using var dlg = new SaveFileDialog
+            {
+                Filter = "CSV 文件 (*.csv)|*.csv",
+                FileName = $"资产台账_{DateTime.Now:yyyyMMdd_HHmm}.csv"
+            };
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+            var sb = new StringBuilder();
+            sb.AppendLine("MAC,计算机名,当前IP,目标主机名,目标IP,CPU,核数,内存(GB),系统盘(GB),磁盘型号,主板,序列号,BIOS版本,BIOS日期,厂商,机型,操作系统,在线,状态,最后心跳");
+            foreach (var it in items)
+            {
+                var hw = it.Hardware;
+                sb.AppendLine(string.Join(",", new[]
+                {
+                    Q(it.Mac), Q(hw?.MachineName ?? it.TargetHostName), Q(it.SourceIp),
+                    Q(it.TargetHostName), Q(it.TargetIp),
+                    Q(hw?.Cpu), Q(hw?.CpuCores.ToString()), Q(hw?.MemoryDisplay?.Replace(" GB","")),
+                    Q(hw?.DiskDisplay?.Replace(" GB","")), Q(hw?.DiskModel), Q(hw?.BaseBoard),
+                    Q(hw?.SerialNumber), Q(hw?.BiosVersion), Q(hw?.BiosDate),
+                    Q(hw?.Manufacturer), Q(hw?.Model), Q(hw?.OsVersion),
+                    Q(it.Online ? "在线" : "离线"), Q(it.StatusDisplay),
+                    Q(it.LastSeen == DateTime.MinValue ? "" : it.LastSeen.ToString("yyyy-MM-dd HH:mm:ss"))
+                }));
+            }
+            try
+            {
+                File.WriteAllText(dlg.FileName, sb.ToString(), new UTF8Encoding(true)); // 带 BOM，Excel 打开不乱码
+                LogLine($"已导出资产台账：{items.Count} 台 → {dlg.FileName}");
+                MessageBox.Show($"已导出 {items.Count} 台终端的资产台账：\n{dlg.FileName}", "导出完成",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("导出失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        /// <summary>CSV 字段转义。</summary>
+        private static string Q(string s)
+        {
+            s ??= "";
+            if (s.Contains(',') || s.Contains('"') || s.Contains('\n') || s.Contains('\r'))
+                return "\"" + s.Replace("\"", "\"\"") + "\"";
+            return s;
+        }
+
+        /// <summary>批量重启选中终端（给 10 秒缓冲，被控端收到后 shutdown /r）。</summary>
+        private void BatchRebootSelected()
+        {
+            var items = SelectedItems();
+            if (items.Count == 0) { MessageBox.Show("请先选中要重启的终端（Ctrl/Shift 多选）。", "提示"); return; }
+            if (MessageBox.Show($"确认重启选中的 {items.Count} 台终端？（10 秒后重启）", "确认",
+                    MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
+
+            string sid = _session.SessionId;
+            string bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
+            int ok = 0, fail = 0;
+            foreach (var it in items)
+            {
+                string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
+                if (string.IsNullOrEmpty(target)) { fail++; continue; }
+                var cmd = new MasterRebootCmdMsg(sid) { LocalMac = it.Mac, DelaySeconds = 10 };
+                if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err)) ok++;
+                else { fail++; LogLine($"[重启] {it.TargetHostName}（{target}）下发失败：{err}"); }
+            }
+            LogLine($"批量重启：成功下发 {ok} 台，失败 {fail} 台");
+            MessageBox.Show($"已下发重启：成功 {ok} 台，失败 {fail} 台（详见日志）。", "批量重启",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        /// <summary>
+        /// 按上线顺序给「在线未上报」的终端分配后缀编号（01、02、03…），下发后由被控端自动填写并提交上报。
+        ///
+        /// 顺序取的是会话列表的插入顺序：每次心跳/上报发现新终端都追加到列表末尾，
+        /// 所以这个顺序就是真实的上线先后（与网格的排序/筛选无关）。
+        /// 已上报的终端占用的编号会被跳过，不会出现两台机器同号。
+        /// </summary>
+        private void AssignSuffixByOnlineOrder()
+        {
+            if (!_broadcasting)
+            {
+                MessageBox.Show("请先点【开始发布模板】。\n\n被控端要先收到本批次的模板，才会接受编号指令并把编号换算成主机名/IP。",
+                    "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var picked = SelectedItems();
+            bool scoped = picked.Count > 0;
+            var pool = scoped ? picked : _session.Items.ToList();
+            var candidates = pool
+                .Where(x => x.Status == SlaveStatus.Online && string.IsNullOrWhiteSpace(x.Suffix))
+                .ToList();
+
+            if (candidates.Count == 0)
+            {
+                MessageBox.Show(scoped
+                        ? "选中的终端里没有可编号的机器。\n\n只处理“在线未上报、且还没有后缀编号”的终端。"
+                        : "当前没有可编号的终端（在线未上报）。\n\n被控端启动后会先发心跳出现在列表里，状态为“在线未上报”，\n此时才能按顺序发号。",
+                    "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            // 已被占用的编号：候选之外的终端（已上报/已编号）现有的后缀
+            var candidateSet = new HashSet<string>(candidates.Select(x => x.Mac), StringComparer.OrdinalIgnoreCase);
+            var usedSuffixes = _session.Items
+                .Where(x => !candidateSet.Contains(x.Mac))
+                .Select(x => x.Suffix)
+                .ToList();
+
+            // 先预演一遍，把要发的号算出来给操作员确认（避免点下去就改了一堆机器的名字）
+            var suffixes = SuffixPlanner.Plan(usedSuffixes, candidates.Count);
+            var plan = new List<KeyValuePair<SlaveSessionItem, string>>();
+            for (int i = 0; i < suffixes.Count; i++)
+                plan.Add(new KeyValuePair<SlaveSessionItem, string>(candidates[i], suffixes[i]));
+            if (plan.Count == 0)
+            {
+                MessageBox.Show("编号已用尽（后缀对应的 IP 末段最大 254）。请先重置会话，或手工调整部分终端的编号。",
+                    "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var preview = new StringBuilder();
+            foreach (var kv in plan.Take(10))
+            {
+                string tgt = string.IsNullOrEmpty(kv.Key.SourceIp) ? kv.Key.TargetIp : kv.Key.SourceIp;
+                preview.AppendLine($"  {kv.Value}  →  {kv.Key.Mac}  ({tgt})");
+            }
+            if (plan.Count > 10) preview.AppendLine($"  … 共 {plan.Count} 台");
+
+            string scopeText = scoped ? $"选中的 {candidates.Count} 台" : $"全部 {candidates.Count} 台在线未上报终端";
+            string tail = candidates.Count > plan.Count
+                ? $"\n注意：可用编号不足，只处理前 {plan.Count} 台。"
+                : "";
+            if (MessageBox.Show($"按上线顺序对{scopeText}下发编号：\n\n{preview}{tail}\n" +
+                                "被控端收到后会自己填好编号并立即提交上报（主机名 = 前缀 + 编号，IP 末段 = 编号 + 1）。\n" +
+                                "上线早的在前（列表从上到下就是这个顺序）。确定下发？",
+                    "按上线顺序编号", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+                return;
+
+            string sid = _session.SessionId;
+            string bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
+            int ok = 0, fail = 0;
+            foreach (var kv in plan)
+            {
+                var it = kv.Key;
+                string suffix = kv.Value;
+                string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
+                if (string.IsNullOrEmpty(target))
+                {
+                    fail++;
+                    LogLine($"[编号] {it.Mac} 没有可用地址（既无来源 IP 也无目标 IP），跳过");
+                    continue;
+                }
+                var cmd = new MasterAssignSuffixCmdMsg(sid, it.Mac, suffix);
+                if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err))
+                {
+                    ok++;
+                    it.Suffix = suffix;      // 先记下来让界面有反馈；被控端上报回来后以它为准
+                    LogLine($"[编号] {it.Mac}（{target}）← {suffix}");
+                }
+                else
+                {
+                    fail++;
+                    LogLine($"[编号] {it.Mac}（{target}）下发失败：{err}");
+                }
+            }
+
+            RefreshGrid();
+            UpdateStatusBar();
+            ScheduleSave();      // 编号先落盘：控制端意外关掉再开，分配结果还在
+            LogLine($"按上线顺序编号：成功下发 {ok} 台，失败 {fail} 台");
+            MessageBox.Show($"已下发编号：成功 {ok} 台，失败 {fail} 台（详见日志）。\n\n" +
+                            "被控端会自动填好编号并提交上报，列表里状态会变成“已上报待审核”。\n" +
+                            "若某台一直停在“在线未上报”，说明它没收到指令（离线/会话不一致），可再点一次。",
+                "按上线顺序编号", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        /// <summary>
+        /// 批量关机选中终端（给 10 秒缓冲，被控端收到后 shutdown /s）。
+        /// 关机后该终端会离线，只能靠 WOL 或现场开机。
+        /// </summary>
+        private void BatchShutdownSelected()
+        {
+            var items = SelectedItems();
+            if (items.Count == 0) { MessageBox.Show("请先选中要关机的终端（Ctrl/Shift 多选）。", "提示"); return; }
+            if (MessageBox.Show($"确认关闭选中的 {items.Count} 台终端？\n\n" +
+                                "• 被控端执行 shutdown /s /t 10（10 秒后关机）；\n" +
+                                "• 关机后这些终端会变成“离线”，要再操作只能 WOL 唤醒或现场开机；\n" +
+                                "• 10 秒内可在被控端本机执行 shutdown /a 取消。",
+                    "批量关机", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
+
+            string sid = _session.SessionId;
+            string bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
+            int ok = 0, fail = 0;
+            foreach (var it in items)
+            {
+                string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
+                if (string.IsNullOrEmpty(target)) { fail++; continue; }
+                var cmd = new MasterShutdownCmdMsg(sid) { LocalMac = it.Mac, DelaySeconds = 10 };
+                if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err)) ok++;
+                else { fail++; LogLine($"[关机] {it.TargetHostName}（{target}）下发失败：{err}"); }
+            }
+            LogLine($"批量关机：成功下发 {ok} 台，失败 {fail} 台");
+            MessageBox.Show($"已下发关机：成功 {ok} 台，失败 {fail} 台（详见日志）。\n\n" +
+                            "10 秒后关机，之后列表里会显示“离线”。",
+                "批量关机", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        /// <summary>
+        /// 批量开关选中终端的开机自启动（写/删被控端注册表 Run 项）。
+        /// 只对“当前会话内收到过模板且在线”的终端有效；离线终端会被统计为发送失败。
+        /// </summary>
+        private void BatchSetAutostartSelected(bool enable)
+        {
+            var items = SelectedItems();
+            if (items.Count == 0) { MessageBox.Show("请先选中要操作的终端（Ctrl/Shift 多选）。", "提示"); return; }
+            if (!_broadcasting)
+            {
+                // 被控端只有收到模板后才会接受该会话的指令，没广播时下发必然被丢，先拦住
+                MessageBox.Show("请先点【开始发布模板】。\n\n被控端要先收到本批次的模板，才会接受指令（会话 ID 必须一致）。",
+                    "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            string what = enable ? "开启" : "取消";
+            if (MessageBox.Show($"确认对选中的 {items.Count} 台终端{what}开机自启动？\n\n" +
+                                "• 被控端需在线，且本批次已收到过模板（会话一致）才会执行；\n" +
+                                "• 只改注册表 Run 项，不动网络配置、也不会关闭被控端程序；\n" +
+                                "• 若被控端当前账户无权写 HKLM，会退到 HKCU 或记录失败原因。",
+                    "批量" + what + "开机自启", MessageBoxButtons.OKCancel,
+                    enable ? MessageBoxIcon.Question : MessageBoxIcon.Warning) != DialogResult.OK) return;
+
+            string sid = _session.SessionId;
+            string bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
+            int ok = 0, fail = 0;
+            foreach (var it in items)
+            {
+                string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
+                if (string.IsNullOrEmpty(target))
+                {
+                    fail++;
+                    LogLine($"[自启] {it.TargetHostName}（{it.Mac}）没有可用地址，跳过");
+                    continue;
+                }
+                var cmd = new MasterAutostartCmdMsg(sid, it.Mac, enable);
+                if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err)) ok++;
+                else { fail++; LogLine($"[自启] {it.TargetHostName}（{target}）下发失败：{err}"); }
+            }
+            LogLine($"批量{what}开机自启：成功下发 {ok} 台，失败 {fail} 台");
+            MessageBox.Show($"已下发“{what}开机自启”：成功 {ok} 台，失败 {fail} 台（详见日志）。\n\n" +
+                            "被控端日志会出现“控制端指令：…”，界面上的勾选框会同步变化。",
+                "批量" + what + "开机自启", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        /// <summary>对选中终端发 WOL 魔术包（关机状态也能唤醒，前提是同一广播域且 BIOS/网卡开了网络唤醒）。</summary>
+        private void WakeSelected()
+        {
+            var items = SelectedItems();
+            if (items.Count == 0) { MessageBox.Show("请先选中要唤醒的终端（可以选中离线终端）。", "提示"); return; }
+            string broadcast = SelectedBroadcastIp();
+            if (!string.IsNullOrEmpty(broadcast) && broadcast.EndsWith(".250")) { /* 用本机 IP 推子网广播 */ }
+            string bip = BuildSubnetBroadcast(broadcast ?? NetworkHelper.GetLocalIpv4(), _txtMask.Text);
+
+            int ok = 0, fail = 0;
+            foreach (var it in items)
+            {
+                if (WakeOnLan.Send(it.Mac, bip, out string err)) ok++;
+                else { fail++; LogLine($"[WOL] {it.Mac} 发送失败：{err}"); }
+            }
+            LogLine($"WOL：向 {bip}:9 发送魔术包，成功 {ok} 台，失败 {fail} 台");
+            MessageBox.Show($"已发送 {ok} 个魔术包（广播地址 {bip}:9）。\n\n" +
+                            "若没唤醒：确认目标机与控制在同一广播域、BIOS/网卡已开启网络唤醒、Windows 关闭了快速启动。",
+                "WOL 唤醒", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        /// <summary>按本机 IP + 掩码算子网定向广播地址（比 255.255.255.255 更容易走对网卡）。</summary>
+        private static string BuildSubnetBroadcast(string ip, string mask)
+        {
+            if (!Validators.TryParseIpv4(ip, out byte[] a)) return "255.255.255.255";
+            if (!Validators.TryParseIpv4(mask, out byte[] m)) return "255.255.255.255";
+            var b = new byte[4];
+            for (int i = 0; i < 4; i++) b[i] = (byte)(a[i] | ~m[i]);
+            return $"{b[0]}.{b[1]}.{b[2]}.{b[3]}";
+        }
+
+
+        /// <summary>
+        /// 生成「MAC→后缀」导入模板：把当前终端列表的 MAC 预先填好，操作员只填后缀，
+        /// 填完再用【导入 MAC→后缀 CSV】倒回来。模板里带一行说明，导入时会被自动忽略。
+        /// </summary>
+        private void ExportMacSuffixTemplate()
+        {
+            var items = _session.Items.ToList();
+            if (items.Count == 0)
+            {
+                MessageBox.Show("终端列表为空。可以先让被控端上报，或手工新建模板后逐行填写 MAC。", "提示");
+            }
+
+            using var dlg = new SaveFileDialog
+            {
+                Filter = "CSV 文件 (*.csv)|*.csv",
+                FileName = "MAC后缀-导入模板.csv"
+            };
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+            var sb = new StringBuilder();
+            sb.AppendLine("# MAC→后缀 导入模板：只填第 2 列“后缀”，保存为 CSV 后点【导入 MAC→后缀 CSV】。");
+            sb.AppendLine("# 后缀规则：主机名 = 界面上“计算机名前缀” + 后缀原文；IP 末段 = 后缀 + 1（1 → .2）。");
+            sb.AppendLine("MAC,后缀,当前主机名（仅参考，可删）");
+            foreach (var it in items)
+                sb.AppendLine($"{Q(it.Mac)},{Q(it.Suffix)},{Q(it.TargetHostName)}");
+            if (items.Count == 0)
+                sb.AppendLine("00-11-22-33-44-55,,（示例行，请替换成真实 MAC）");
+
+            try
+            {
+                File.WriteAllText(dlg.FileName, sb.ToString(), new UTF8Encoding(true)); // BOM：Excel 打开不乱码
+                LogLine($"已生成 MAC→后缀 导入模板：{items.Count} 行 → {dlg.FileName}");
+                MessageBox.Show($"模板已生成（{items.Count} 行）：\n{dlg.FileName}\n\n" +
+                                "用 Excel 打开，只填“后缀”列，保存后回到这里点【导入 MAC→后缀 CSV】。",
+                    "生成模板", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("生成失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void ImportMacSuffixCsv()
+        {
+            using var dlg = new OpenFileDialog { Filter = "CSV 文件 (*.csv)|*.csv|所有文件 (*.*)|*.*", Title = "导入 MAC→后缀 清单" };
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+            string[] lines;
+            try { lines = File.ReadAllLines(dlg.FileName, Encoding.UTF8); }
+            catch (Exception ex) { MessageBox.Show("读取失败：" + ex.Message); return; }
+
+            int applied = 0, skipped = 0;
+            var problems = new List<string>();
+            foreach (var raw in lines)
+            {
+                var line = (raw ?? "").Trim();
+                if (line.Length == 0 || line.StartsWith("#")) continue;
+                var parts = line.Split(new[] { ',', '，', '\t', ';' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 2) { skipped++; continue; }
+                string mac = NetworkHelper.NormalizeMac(parts[0]);
+                string suffix = parts[1].Trim();
+                if (!Validators.IsValidMac(mac)) { if (!line.StartsWith("MAC", StringComparison.OrdinalIgnoreCase)) skipped++; continue; }
+
+                var it = _session.GetByMac(mac);
+                if (it == null) { problems.Add($"未找到 MAC {mac}"); skipped++; continue; }
+                if (string.IsNullOrEmpty(suffix)) { skipped++; continue; }   // 模板里没填的行直接跳过
+                if (!int.TryParse(suffix, out int n) || n < 0 || n > 254) { problems.Add($"后缀不合法 {suffix}（{mac}）"); skipped++; continue; }
+
+                string host = _txtHnPrefix.Text + suffix;
+                string ip = _chkDhcp.Checked ? "" : _txtIpPrefix.Text + (n + 1);
+                if (!_chkDhcp.Checked && !Validators.IsValidIp(ip)) { problems.Add($"IP 不合法 {ip}（{mac}）"); skipped++; continue; }
+                if (!Validators.IsValidHostName(host)) { problems.Add($"主机名不合法 {host}（{mac}）"); skipped++; continue; }
+
+                it.Suffix = suffix;
+                it.TargetHostName = host;
+                it.TargetIp = ip;
+                it.IsDhcp = _chkDhcp.Checked;
+                it.Status = SlaveStatus.Reported;
+                it.Skip = false;
+                it.ErrorMsg = "";
+                applied++;
+            }
+            RefreshGrid();
+            UpdateStatusBar();
+            string msg = $"导入完成：应用 {applied} 条，跳过 {skipped} 条。";
+            if (problems.Count > 0) msg += Environment.NewLine + Environment.NewLine + "部分原因：" + Environment.NewLine +
+                                       string.Join(Environment.NewLine, problems.Take(8));
+            MessageBox.Show(msg, "导入结果", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            LogLine($"导入 MAC→后缀：应用 {applied} 条，跳过 {skipped} 条（{dlg.FileName}）");
+        }
+
+        /// <summary>极简输入框（用于筛选条件），避免为了一个输入框引入新窗体类。</summary>
+        private string Prompt(string title, string label)
+        {
+            using var dlg = new Form
+            {
+                Text = title,
+                Size = new Size(UiScale.S(420), UiScale.S(170)),
+                StartPosition = FormStartPosition.CenterParent,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                Font = Font
+            };
+            var lbl = new Label { Text = label, Left = UiScale.S(14), Top = UiScale.S(16), AutoSize = true };
+            var txt = new TextBox { Left = UiScale.S(14), Top = UiScale.S(44), Width = UiScale.S(376) };
+            var ok = new Button { Text = "确定", DialogResult = DialogResult.OK, Left = UiScale.S(228), Top = UiScale.S(86), Width = UiScale.S(76) };
+            var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Left = UiScale.S(312), Top = UiScale.S(86), Width = UiScale.S(76) };
+            dlg.Controls.AddRange(new Control[] { lbl, txt, ok, cancel });
+            dlg.AcceptButton = ok;
+            dlg.CancelButton = cancel;
+            return dlg.ShowDialog(this) == DialogResult.OK ? txt.Text.Trim() : null;
+        }
+
         private void RefreshGrid()
         {
             var items = _session.Items.ToList();
@@ -415,7 +976,7 @@ namespace LanAutoConfig.Master
                 {
                     bool conflict = confIps.Contains(it.TargetIp) || confHosts.Contains(it.TargetHostName ?? "");
                     int idx = _grid.Rows.Add(
-                        it.Mac, it.SourceIp, it.Suffix, it.TargetHostName, it.TargetIp,
+                        it.Mac, it.OnlineDisplay, it.SourceIp, it.Suffix, it.TargetHostName, it.TargetIp,
                         it.SubnetMask, it.Gateway, it.Dns1, it.Dns2,
                         it.IsDhcp ? "DHCP" : "静态",
                         it.StatusDisplay, it.ErrorMsg, conflict ? "冲突" : "");
@@ -424,12 +985,36 @@ namespace LanAutoConfig.Master
                     if (conflict) row.DefaultCellStyle.BackColor = System.Drawing.Color.LightSalmon;
                     if (it.Status == SlaveStatus.Failed) row.DefaultCellStyle.ForeColor = System.Drawing.Color.Red;
                     if (it.Status == SlaveStatus.Skipped) row.DefaultCellStyle.BackColor = System.Drawing.Color.Gainsboro;
+                    if (!it.Online) row.Cells["colOnline"].Style.ForeColor = System.Drawing.Color.Gray;
+                    // 资产摘要挂在 MAC 单元格的提示上，点开不占列宽
+                    if (!string.IsNullOrEmpty(it.HardwareSummary))
+                        row.Cells["colMac"].ToolTipText =
+                            it.HardwareSummary + Environment.NewLine +
+                            $"主板 {it.Hardware?.BaseBoard} / BIOS {it.Hardware?.BiosVersion} / SN {it.Hardware?.SerialNumber}";
                 }
             }
             finally { _grid.ResumeLayout(); }
 
             // 冲突或正在下发时都禁止再次点击下发
             _btnDispatch.Enabled = !hasConflict && !_dispatching;
+        }
+
+        /// <summary>只刷新“在线”列（心跳定时器调用，避免整表刷新打断选择/编辑）。</summary>
+        private void RefreshOnlineCells()
+        {
+            if (_grid == null || _grid.IsDisposed) return;
+            int col = _grid.Columns["colOnline"]?.Index ?? -1;
+            if (col < 0) return;
+            foreach (DataGridViewRow row in _grid.Rows)
+            {
+                if (row.Tag is not SlaveSessionItem it) continue;
+                string text = it.OnlineDisplay;
+                if (!string.Equals(row.Cells[col].Value as string, text, StringComparison.Ordinal))
+                {
+                    row.Cells[col].Value = text;
+                    row.Cells[col].Style.ForeColor = it.Online ? System.Drawing.Color.Green : System.Drawing.Color.Gray;
+                }
+            }
         }
 
         private void _grid_CellEndEdit(object sender, DataGridViewCellEventArgs e)
@@ -713,6 +1298,8 @@ namespace LanAutoConfig.Master
             _lblSuccess.Text = $"成功: {items.Count(x => x.Status == SlaveStatus.Success)}";
             _lblFailed.Text = $"失败: {items.Count(x => x.Status == SlaveStatus.Failed)}";
             _lblConflict.Text = $"冲突: {ConflictValidator.GetConflictIps(items).Count + ConflictValidator.GetConflictHosts(items).Count}";
+            if (_lblOnline != null)
+                _lblOnline.Text = $"在线: {items.Count(x => x.Online)} / {items.Count}";
         }
 
         // ---------- UI 线程封装 ----------
@@ -828,14 +1415,17 @@ namespace LanAutoConfig.Master
             gbDhcp.Controls.Add(pnlDhcp2);
             gbDhcp.Controls.Add(pnlDhcp1);
 
-            // --- 黑名单 ---
-            var gbBlack = new GroupBox { Text = "黑名单", Dock = DockStyle.Fill };
+            // --- 黑名单 / 白名单 ---
+            var gbBlack = new GroupBox { Text = "名单（黑名单拒绝 / 白名单放行）", Dock = DockStyle.Fill };
             var pnlBlack = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 44, Padding = new Padding(10, 8, 10, 0), WrapContents = false };
             _lblBlacklist = new Label { Text = "黑名单：0 条", AutoSize = true, ForeColor = System.Drawing.Color.DimGray, Margin = new Padding(0, 7, 14, 0) };
             _btnManageBlacklist = new Button { Text = "管理黑名单…", Width = 120, Height = 30 };
             _btnManageBlacklist.Click += (s, e) => ShowBlacklist();
+            _btnWhitelist = new Button { Text = "白名单…", Width = 96, Height = 30 };
+            _btnWhitelist.Click += (s, e) => ShowWhitelist();
             pnlBlack.Controls.Add(_lblBlacklist);
             pnlBlack.Controls.Add(_btnManageBlacklist);
+            pnlBlack.Controls.Add(_btnWhitelist);
             gbBlack.Controls.Add(pnlBlack);
 
             root1.Controls.Add(gbRun, 0, 0);
@@ -847,22 +1437,67 @@ namespace LanAutoConfig.Master
 
             // ==================== Tab2 终端列表 ====================
             var tab2 = new TabPage("终端列表") { Padding = new Padding(10) };
-            var bar2 = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 48, Padding = new Padding(0, 2, 0, 6), WrapContents = false };
+            var bar2 = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,                      // 按钮放不下时自动折成两行，不再被固定高度裁掉
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Padding = new Padding(0, 2, 0, 6),
+                WrapContents = true
+            };
             _btnDispatch = new Button { Text = "下发执行命令", Width = 140, Height = 32 };
             _btnDispatch.Click += btnDispatch_Click;
             _btnExportTerminals = new Button { Text = "导出终端列表 CSV", Width = 150, Height = 32 };
             _btnExportTerminals.Click += btnExportTerminalsCsv_Click;
-            _lblGridHint = new Label
-            {
-                Text = "提示：双击“目标主机名 / 目标 IP”单元格可直接改，改完自动校验",
-                AutoSize = true,
-                ForeColor = System.Drawing.Color.DimGray,
-                Margin = new Padding(14, 9, 0, 0)
-            };
+            var btnSelectAll = new Button { Text = "全选", Width = 70, Height = 32 };
+            btnSelectAll.Click += (s, e) => { _grid.SelectAll(); };
+            var btnRefresh = new Button { Text = "刷新列表", Width = 90, Height = 32 };
+            btnRefresh.Click += (s, e) => RefreshTerminalList();
+
+            // ---- 第二行：按上线顺序编号 + 电源类 + 自启 ----
+            var btnAssignSeq = new Button { Text = "按上线顺序编号", Width = 130, Height = 32 };
+            btnAssignSeq.Click += (s, e) => AssignSuffixByOnlineOrder();
+            var btnReboot = new Button { Text = "批量重启", Width = 90, Height = 32 };
+            btnReboot.Click += (s, e) => BatchRebootSelected();
+            var btnShutdown = new Button { Text = "批量关机", Width = 90, Height = 32 };
+            btnShutdown.Click += (s, e) => BatchShutdownSelected();
+            var btnWol = new Button { Text = "WOL 唤醒", Width = 96, Height = 32 };
+            btnWol.Click += (s, e) => WakeSelected();
+            var btnAutostartOn = new Button { Text = "开启自启", Width = 90, Height = 32 };
+            btnAutostartOn.Click += (s, e) => BatchSetAutostartSelected(true);
+            var btnAutostartOff = new Button { Text = "取消自启", Width = 90, Height = 32 };
+            btnAutostartOff.Click += (s, e) => BatchSetAutostartSelected(false);
+
+            var tipBar = new ToolTip();
+            tipBar.SetToolTip(btnAssignSeq, "对“在线未上报”的终端按上线顺序分配 01、02、03… 并让它们自动上报（可先选中部分终端只处理选中的）");
+            tipBar.SetToolTip(btnReboot, "被控端执行 shutdown /r /t 10（10 秒后重启）");
+            tipBar.SetToolTip(btnShutdown, "被控端执行 shutdown /s /t 10（10 秒后关机，之后该终端离线）");
+            tipBar.SetToolTip(btnWol, "向关机中的终端发送 WOL 魔术包（需同一广播域且 BIOS/网卡开启网络唤醒）");
+            tipBar.SetToolTip(btnAutostartOn, "被控端写入注册表 Run 项：开机自动运行本程序（沿用原静默参数）");
+            tipBar.SetToolTip(btnAutostartOff, "被控端删除注册表 Run 项：开机不再自动运行（不影响当前运行）");
+
             bar2.Controls.Add(_btnDispatch);
             bar2.Controls.Add(_btnExportTerminals);
-            bar2.Controls.Add(_lblGridHint);
+            bar2.Controls.Add(btnSelectAll);
+            bar2.Controls.Add(btnRefresh);
+            bar2.SetFlowBreak(btnRefresh, true);      // 显式分成两行，不靠容器宽度“碰运气”
+            bar2.Controls.Add(btnAssignSeq);
+            bar2.Controls.Add(btnReboot);
+            bar2.Controls.Add(btnShutdown);
+            bar2.Controls.Add(btnWol);
+            bar2.Controls.Add(btnAutostartOn);
+            bar2.Controls.Add(btnAutostartOff);
+
+            _lblGridHint = new Label
+            {
+                Text = "提示：可多选（Ctrl/Shift），右键批量删除/标记；双击“目标主机名 / 目标 IP”可直接改",
+                Dock = DockStyle.Bottom,
+                Height = 24,
+                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
+                ForeColor = System.Drawing.Color.DimGray
+            };
             tab2.Controls.Add(bar2);
+            tab2.Controls.Add(_lblGridHint);
 
             _grid = new DataGridView
             {
@@ -870,12 +1505,14 @@ namespace LanAutoConfig.Master
                 AllowUserToAddRows = false,
                 ReadOnly = false,
                 SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                MultiSelect = true,
                 AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
                 RowHeadersVisible = false,
                 BackgroundColor = System.Drawing.SystemColors.Window,
                 BorderStyle = BorderStyle.FixedSingle
             };
             _grid.Columns.Add("colMac", "MAC");
+            _grid.Columns.Add("colOnline", "在线");
             _grid.Columns.Add("colSrc", "来源IP");
             _grid.Columns.Add("colSuffix", "后缀");
             int cHost = _grid.Columns.Add("colHost", "目标主机名");
@@ -936,8 +1573,11 @@ namespace LanAutoConfig.Master
             _lblSuccess = new ToolStripStatusLabel("成功: 0");
             _lblFailed = new ToolStripStatusLabel("失败: 0");
             _lblConflict = new ToolStripStatusLabel("冲突: 0");
+            _lblOnline = new ToolStripStatusLabel("在线: 0 / 0");
             _lblBroadcast = new ToolStripStatusLabel("广播: 未启动");
             _status.Items.Add(_lblReported);
+            _status.Items.Add(new ToolStripSeparator());
+            _status.Items.Add(_lblOnline);
             _status.Items.Add(new ToolStripSeparator());
             _status.Items.Add(_lblPending);
             _status.Items.Add(new ToolStripSeparator());
@@ -977,13 +1617,94 @@ namespace LanAutoConfig.Master
             t.Controls.Add(input, col + 1, row);
         }
 
+        // ---------- 配置持久化 ----------
+
+        private readonly string _settingsPath = AppConfig.MasterSettingsPath;
+
+        /// <summary>合并写盘：改动后 3 秒写一次，避免每次心跳/上报都写文件。</summary>
+        private void ScheduleSave()
+        {
+            try
+            {
+                if (_saveTimer == null) return;
+                _saveTimer.Stop();
+                _saveTimer.Start();
+            }
+            catch { }
+        }
+
+        private void SaveSettings()
+        {
+            try
+            {
+                var s = new MasterSettings
+                {
+                    SessionId = _session.SessionId,
+                    IpPrefix = _txtIpPrefix.Text,
+                    SubnetMask = _txtMask.Text,
+                    Gateway = _txtGw.Text,
+                    Dns1 = _txtDns1.Text,
+                    Dns2 = _txtDns2.Text,
+                    HostNamePrefix = _txtHnPrefix.Text,
+                    IsDhcp = _chkDhcp.Checked,
+                    DhcpServer = _chkDhcpServer.Checked,
+                    AdapterAlias = (_cmbAdapter.SelectedItem as NetworkAdapterInfo)?.Alias,
+                    Items = _session.Items.ToList()
+                };
+                s.Save(_settingsPath);
+            }
+            catch { }
+        }
+
+        private void LoadSettings()
+        {
+            var s = MasterSettings.Load(_settingsPath);
+            if (s == null) return;
+            try
+            {
+                if (!string.IsNullOrEmpty(s.IpPrefix)) _txtIpPrefix.Text = s.IpPrefix;
+                if (!string.IsNullOrEmpty(s.SubnetMask)) _txtMask.Text = s.SubnetMask;
+                if (!string.IsNullOrEmpty(s.Gateway)) _txtGw.Text = s.Gateway;
+                if (s.Dns1 != null) _txtDns1.Text = s.Dns1;
+                if (s.Dns2 != null) _txtDns2.Text = s.Dns2;
+                if (!string.IsNullOrEmpty(s.HostNamePrefix)) _txtHnPrefix.Text = s.HostNamePrefix;
+                _chkDhcp.Checked = s.IsDhcp;
+                _chkDhcpServer.Checked = s.DhcpServer;
+
+                if (!string.IsNullOrEmpty(s.AdapterAlias))
+                {
+                    for (int i = 0; i < _cmbAdapter.Items.Count; i++)
+                    {
+                        if (_cmbAdapter.Items[i] is NetworkAdapterInfo a &&
+                            string.Equals(a.Alias, s.AdapterAlias, StringComparison.OrdinalIgnoreCase))
+                        { _cmbAdapter.SelectedIndex = i; break; }
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(s.SessionId))
+                    _session.Restore(s.SessionId, s.Items);
+
+                RefreshGrid();
+                UpdateStatusBar();
+                RefreshBlacklistSummary();
+                LogLine($"已恢复上次配置（会话 {ShortId(_session.SessionId)}，终端 {s.Items.Count} 台，保存于 {s.SavedAt:MM-dd HH:mm}）");
+            }
+            catch (Exception ex)
+            {
+                LogLine("恢复上次配置失败：" + ex.Message);
+            }
+        }
+
         // ---------- 黑名单展示 ----------
 
-        /// <summary>刷新模板页上的黑名单摘要（条数）。</summary>
+        /// <summary>刷新模板页上的黑/白名单摘要。</summary>
         private void RefreshBlacklistSummary()
         {
             if (_lblBlacklist == null) return;
-            _lblBlacklist.Text = $"黑名单：{_blacklist.Macs.Count} 条 MAC / {_blacklist.Ips.Count} 条 IP（在“终端列表”右键添加）";
+            string wl = _whitelist.Enabled
+                ? $"白名单：已启用 {_whitelist.Macs.Count} 条"
+                : $"白名单：未启用（{_whitelist.Macs.Count} 条）";
+            _lblBlacklist.Text = $"黑名单：{_blacklist.Macs.Count} 条 MAC / {_blacklist.Ips.Count} 条 IP；{wl}";
         }
 
         /// <summary>弹窗显示黑名单明细。</summary>
@@ -994,6 +1715,15 @@ namespace LanAutoConfig.Master
             dlg.Changed += () => RefreshBlacklistSummary();
             dlg.ShowDialog(this);
             RefreshBlacklistSummary();
+        }
+
+        /// <summary>弹窗管理 MAC 白名单（启用后只接受名单里的终端上报）。</summary>
+        private void ShowWhitelist()
+        {
+            using var dlg = new WhitelistForm(_whitelist, _session.Items.ToList());
+            dlg.ShowDialog(this);
+            RefreshBlacklistSummary();
+            LogLine($"白名单已更新：{( _whitelist.Enabled ? "启用" : "未启用")}，共 {_whitelist.Macs.Count} 条");
         }
 
         // ---------- 广播网卡选择 ----------
