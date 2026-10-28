@@ -468,3 +468,39 @@ v3.0（资产 / 在线状态 / 白名单，本轮进行中）：
       ③ **禁止把“本机原有地址”当临时地址**——原逻辑在验证失败时会 `RemoveTempIp` 回滚，
       若候选正好等于本机当前地址，就等于把机器 IP 删了；现在直接跳过并写明原因；
       ④ 全部候选失败时，错误信息列出三类常见原因（地址占满 / IP 冲突 / 非管理员）。
+71. **被控端单实例：已启动时不再启动第二个**（`Slave/Program.cs`）：
+    - **问题**：重复双击/开机自启叠加时会出现两个被控端窗口，两边抢同一张网卡、同一份 `slave.log`，
+      还会各自响应控制端指令（双份心跳、双份执行），现场极难排查；
+    - **实现**：启动即申请命名互斥体 `Global\LanAutoConfigSlave.SingleInstance`
+      （跨登录会话唯一）；`Global\` 无权限时退回 `Local\`。已有实例则弹窗
+      “被控端程序已启动，不再启动第二个。”并退出，同时写一条日志；
+    - **静默模式例外**：`--silent`（开机自启触发）时只写日志、不弹窗，避免把无人值守流程卡在对话框上；
+    - 互斥体申请本身出错时**放行启动**（宁可多开一个，也不能让装机流程卡死）。
+72. **终端列表：横向+纵向滚动条，单元格内容显示完整**（`Master/MasterForm.cs`）：
+    - **问题**：原用 `AutoSizeColumnsMode.Fill` 把列压缩到窗口宽度，`错误信息`/`失败归类` 这类长内容
+      只能看到开头几个字，也没有横向滚动条；
+    - **改法**：① 关闭自动填满，按内容给足列宽（MAC 140 / 错误信息 280 / 失败归类 200 等，总宽约 1900px，
+      高 DPI 下按 `UiScale.S` 放大）；② `ScrollBars = Both` 显示横纵两个滚动条；
+      ③ 单元格 `WrapMode = True` + 行高 `DisplayedCellsExceptHeaders` 自适应，长文本换行显示完整；
+      ④ `MAC` 列 `Frozen = true`，横向滑动时始终固定在最左，不会滑到右边就不知道是哪台；
+      ⑤ 错误信息 / 失败建议 / 硬件摘要都挂了 ToolTip，悬停可看完整原文；
+      ⑥ 列宽仍可手动拖动（`MinimumWidth` 46 防止拖成看不见）。
+73. **被控端“状态与本地日志”自动换行**（`Slave/SlaveForm.cs`）：
+    - **问题**：状态行用 `FlowLayoutPanel` + `AutoSize` 的 Label，文字一长就被直接裁掉（比如带 IP 的失败原因），
+      日志框 `WordWrap = false`，长输出只能横向拖着看；
+    - **改法**：① 状态区改为 `Panel + Label(AutoSize=false, Dock=Fill)`——固定宽度时 Label 才会自动换行；
+      ② `FitStatusHeight()` 用 `TextRenderer.MeasureText` 按当前宽度量出实际行数，动态调整状态区高度
+      （最小 34px，最多 112px，再多就交给日志滚动），窗口缩放时也重新量；
+      ③ 日志框 `WordWrap = true`，长行自动折行，不再需要横向滚动。
+74. **修复：CMD 执行器输出中文乱码**（`Common/ConsoleText.cs`、`Slave/LocalNetChanger.cs`）：
+    - **现象**：下发 CMD 命令后，控制端“输出/错误”列、被控端状态与本地日志里的中文全是乱码；
+    - **根因**：`RunCmd` 里写的是 `StandardOutputEncoding = new UTF8Encoding(false)`，
+      但 `cmd.exe` 以及 `ipconfig`/`netsh`/`systeminfo` 这类程序输出到管道时用的是**控制台 OEM 代码页**
+      （简体中文 = 936/GBK），按 UTF-8 解自然全乱；
+    - **修复**：新增 `ConsoleText.Decode(byte[])`，读取 `BaseStream` 的**原始字节**再判定编码：
+      BOM → 按 BOM；纯 ASCII → 原样；严格 UTF-8（`throwOnInvalidBytes`）能解通就用 UTF-8；
+      否则退回本机 OEM 代码页（`GetOEMCP`，中文系统 936），再不行用 ANSI。
+      `CodePagesEncodingProvider` 在静态初始化时注册（.NET Core 默认不带 936）；
+    - **兼容**：PowerShell 执行器不动——它在脚本里已设 `[Console]::OutputEncoding = UTF8`，
+      输出本来就是 UTF-8，解码正确；只有 CMD 分支需要按 OEM 处理；
+    - **验证**：自测里用**真实 `cmd.exe` 输出**（而不是人造字节）验证中文能正确解出，38 项断言全过。

@@ -1293,6 +1293,9 @@ namespace LanAutoConfig.Master
                     }
                     if (!string.IsNullOrEmpty(it.FailSuggestion))
                         row.Cells["colFailCat"].ToolTipText = it.FailSuggestion;
+                    // 错误信息即使折行也可能看不全（被窗口高度限制），悬停给完整原文
+                    if (!string.IsNullOrEmpty(it.ErrorMsg))
+                        row.Cells["colErr"].ToolTipText = it.ErrorMsg;
                     // 资产摘要挂在 MAC 单元格的提示上，点开不占列宽
                     if (!string.IsNullOrEmpty(it.HardwareSummary))
                         row.Cells["colMac"].ToolTipText =
@@ -1857,11 +1860,23 @@ namespace LanAutoConfig.Master
                 ReadOnly = false,
                 SelectionMode = DataGridViewSelectionMode.FullRowSelect,
                 MultiSelect = true,
-                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+                // 不用 Fill 自动填满：列会被压得很窄，错误信息/失败归类这些长内容根本看不全。
+                // 改成「固定列宽 + 双向滚动条 + 单元格折行 + 行高自适应」，
+                // 短内容一格显示完，长内容换行显示完整，列多时拖横向滚动条看。
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None,
+                ScrollBars = ScrollBars.Both,
+                AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.DisplayedCellsExceptHeaders,
+                ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize,
+                AllowUserToResizeColumns = true,
+                AllowUserToResizeRows = false,
                 RowHeadersVisible = false,
                 BackgroundColor = System.Drawing.SystemColors.Window,
                 BorderStyle = BorderStyle.FixedSingle
             };
+            _grid.DefaultCellStyle.WrapMode = DataGridViewTriState.True;
+            _grid.DefaultCellStyle.Padding = new Padding(2, 1, 2, 1);
+            // 折行后行高由内容撑开，但限制单行最高高度，避免一条超长错误信息把整屏占满
+            _grid.RowTemplate.MinimumHeight = 20;
             _grid.Columns.Add("colMac", "MAC");
             _grid.Columns.Add("colOnline", "在线");
             _grid.Columns.Add("colSrc", "来源IP");
@@ -1882,6 +1897,28 @@ namespace LanAutoConfig.Master
             foreach (DataGridViewColumn col in _grid.Columns) col.ReadOnly = true;
             _grid.Columns[cHost].ReadOnly = false;
             _grid.Columns[cIp].ReadOnly = false;
+
+            // 列宽：按内容实际长度给足（不再自动压缩），总宽超出窗口时用横向滚动条看。
+            // 长文本列（错误信息/失败归类）给宽一点并自动折行，保证整段内容能看全。
+            var colWidths = new (string Name, int Width)[]
+            {
+                ("colMac", 140), ("colOnline", 62), ("colSrc", 112), ("colSuffix", 58),
+                ("colHost", 140), ("colIp", 120), ("colMask", 116), ("colGw", 118),
+                ("colDns", 118), ("colDns2", 118), ("colMode", 78), ("colStatus", 118),
+                ("colErr", 280), ("colConf", 66), ("colVerify", 78), ("colFailCat", 200)
+            };
+            foreach (var (name, width) in colWidths)
+            {
+                var col = _grid.Columns[name];
+                if (col == null) continue;
+                col.MinimumWidth = UiScale.S(46);
+                col.Width = UiScale.S(width);
+            }
+            // 横向滚动时 MAC 固定在左侧，不然滑到右边就不知道这一行是哪台机器
+            _grid.Columns["colMac"].Frozen = true;
+            _grid.Columns["colErr"].DefaultCellStyle.WrapMode = DataGridViewTriState.True;
+            _grid.Columns["colFailCat"].DefaultCellStyle.WrapMode = DataGridViewTriState.True;
+            _grid.Columns["colMac"].DefaultCellStyle.Font = new System.Drawing.Font("Consolas", 9F);
             _grid.CellEndEdit += _grid_CellEndEdit;
             GridContextMenu();
             tab2.Controls.Add(_grid);

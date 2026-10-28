@@ -28,6 +28,8 @@ namespace LanAutoConfig.Slave
 
         // UI
         private Label _lblStatus, _lblTmplIp, _lblTmplMask, _lblTmplGw, _lblTmplDns, _lblTmplHn, _lblTmplDhcp, _lblSession;
+        /// <summary>状态文字容器（高度随文字行数自动调整）。</summary>
+        private Panel _pnlStatus;
         private ComboBox _cmbAdapter;
         private TextBox _txtSuffix;
         private Label _lblPreviewHost, _lblPreviewIp;
@@ -1112,26 +1114,31 @@ namespace LanAutoConfig.Slave
 
             // ---------- 状态与日志 ----------
             var gbLog = new GroupBox { Text = "状态与本地日志", Dock = DockStyle.Fill };
-            var pnlStatus = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 32, Padding = new Padding(12, 6, 12, 0), WrapContents = false };
+            // 状态用 Panel+Label（不用 FlowLayoutPanel）：Label 固定宽度时才会自动换行，
+            // FlowLayoutPanel 里 AutoSize 的 Label 超出宽度会被直接裁掉。
+            _pnlStatus = new Panel { Dock = DockStyle.Top, Height = 34, Padding = new Padding(12, 6, 12, 0) };
             _lblStatus = new Label
             {
                 Text = "正在监听控制端广播…",
-                AutoSize = true,
+                AutoSize = false,
+                Dock = DockStyle.Fill,
+                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
                 Font = new System.Drawing.Font("Microsoft YaHei UI", 9.5F, System.Drawing.FontStyle.Bold)
             };
-            pnlStatus.Controls.Add(_lblStatus);
+            _pnlStatus.Controls.Add(_lblStatus);
+            _lblStatus.TextChanged += (s, e) => FitStatusHeight();   // 文字变长就长高，不裁字
             _txtLog = new TextBox
             {
                 Multiline = true,
                 ScrollBars = ScrollBars.Vertical,
                 ReadOnly = true,
-                WordWrap = false,
+                WordWrap = true,          // 长行自动折行，不再需要横向滚动条
                 Dock = DockStyle.Fill,
                 BackColor = System.Drawing.Color.White,
                 Font = new System.Drawing.Font("Consolas", 9F)
             };
             gbLog.Controls.Add(_txtLog);
-            gbLog.Controls.Add(pnlStatus);
+            gbLog.Controls.Add(_pnlStatus);
 
             root.Controls.Add(gbTmpl, 0, 0);
             root.Controls.Add(gbNic, 0, 1);
@@ -1141,6 +1148,33 @@ namespace LanAutoConfig.Slave
             Controls.Add(root);
 
             UiScale.Apply(this);   // 高 DPI：把上面写死的像素常量按系统缩放比例放大
+
+            // 窗口宽度变化后换行行数会变，重新量一次状态区高度
+            Resize += (s, e) => FitStatusHeight();
+            FitStatusHeight();
+        }
+
+        /// <summary>
+        /// 按状态文字的实际行数调整状态区高度：短消息一行（约 34px），
+        /// 长消息（带 IP/错误原因那种）自动长到 2~3 行，避免文字被裁掉看不到关键信息。
+        /// </summary>
+        private void FitStatusHeight()
+        {
+            if (_pnlStatus == null || _lblStatus == null || _pnlStatus.IsDisposed || _lblStatus.IsDisposed) return;
+
+            int w = _lblStatus.ClientSize.Width;
+            if (w < 40) w = Math.Max(120, _pnlStatus.ClientSize.Width - _pnlStatus.Padding.Horizontal);
+
+            Size measured = TextRenderer.MeasureText(
+                _lblStatus.Text ?? "", _lblStatus.Font, new Size(w, int.MaxValue),
+                TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPadding);
+
+            int want = measured.Height + _pnlStatus.Padding.Vertical + UiScale.S(8);
+            int min = UiScale.S(34);
+            int max = UiScale.S(112);   // 状态区最多占 3~4 行，再多就给日志滚
+            int h = Math.Max(min, Math.Min(max, want));
+
+            if (_pnlStatus.Height != h) _pnlStatus.Height = h;
         }
 
         private static Label NewValueLabel() => new Label

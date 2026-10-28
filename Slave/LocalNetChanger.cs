@@ -291,7 +291,14 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
             return RunCmd(code);
         }
 
-        /// <summary>用 cmd.exe /c 执行一段命令（用于“命令(cmd)”方式下发的脚本）。</summary>
+        /// <summary>
+        /// 用 cmd.exe /c 执行一段命令（用于“命令(cmd)”方式下发的脚本）。
+        ///
+        /// 编码说明：cmd.exe 及 ipconfig/netsh/systeminfo 这类程序把文本写到控制台时用的是
+        /// OEM 代码页（简体中文 = 936/GBK），不是 UTF-8。之前这里按 UTF-8 解码，
+        /// 中文输出到控制端/被控端日志就成了乱码。现在改成读「原始字节」，
+        /// 交给 <see cref="ConsoleText.Decode"/> 判定 UTF-8 还是 OEM 代码页。
+        /// </summary>
         private PsResult RunCmd(string command)
         {
             var result = new PsResult();
@@ -304,6 +311,7 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
                     RedirectStandardError = true,
                     CreateNoWindow = true,
                     WindowStyle = ProcessWindowStyle.Hidden,
+                    // 不用 StreamReader 的编码解码，改为直接读 BaseStream 原始字节（见下）
                     StandardOutputEncoding = new UTF8Encoding(false),
                     StandardErrorEncoding = new UTF8Encoding(false),
                     Arguments = "/c " + command
@@ -311,12 +319,29 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
                 using var p = Process.Start(psi);
                 if (p == null) { result.Success = false; result.Error = "无法启动 cmd.exe"; return result; }
 
-                Task<string> outTask = p.StandardOutput.ReadToEndAsync();
-                Task<string> errTask = p.StandardError.ReadToEndAsync();
-                if (!p.WaitForExit(60000)) { try { p.Kill(true); } catch { } result.Success = false; result.Error = "命令执行超时（60 秒），已强制结束"; return result; }
+                using var outBuf = new MemoryStream();
+                using var errBuf = new MemoryStream();
+                Task outCopy = p.StandardOutput.BaseStream.CopyToAsync(outBuf);
+                Task errCopy = p.StandardError.BaseStream.CopyToAsync(errBuf);
 
-                result.Output = (outTask.GetAwaiter().GetResult() ?? "").Trim();
-                result.Error = (errTask.GetAwaiter().GetResult() ?? "").Trim();
+                if (!p.WaitForExit(60000))
+                {
+                    try { p.Kill(true); } catch { }
+                    result.Success = false;
+                    result.Error = "命令执行超时（60 秒），已强制结束";
+                    result.ExitCode = -1;
+                    // 超时也把已产生的输出带回去，方便判断卡在哪一步
+                    try { Task.WaitAll(new[] { outCopy, errCopy }, 2000); } catch { }
+                    result.Output = ConsoleText.Decode(outBuf.ToArray()).Trim();
+                    result.Error += result.Output.Length > 0 ? "\n（超时前输出见“输出”列）" : "";
+                    return result;
+                }
+
+                // 进程已退出，管道可能还有残余数据，给读取任务一点时间收尾（不能无限等）
+                try { Task.WaitAll(new[] { outCopy, errCopy }, 5000); } catch { }
+
+                result.Output = ConsoleText.Decode(outBuf.ToArray()).Trim();
+                result.Error = ConsoleText.Decode(errBuf.ToArray()).Trim();
                 result.ExitCode = p.ExitCode;
                 // cmd 的“成功”以退出码为准；但某些脚本即便有 stderr 仍算“跑完了”，所以只要退出码 0 就成功
                 result.Success = p.ExitCode == 0;

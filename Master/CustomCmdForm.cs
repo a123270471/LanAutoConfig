@@ -64,7 +64,7 @@ namespace LanAutoConfig.Master
             root.Controls.Add(_lblStatus, 0, 2);
 
             // 结果列表
-            _lv = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true };
+            _lv = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, ShowItemToolTips = true };
             _lv.Columns.Add("MAC", 140); _lv.Columns.Add("结果", 70); _lv.Columns.Add("退出码", 60); _lv.Columns.Add("输出 / 错误", 380);
             root.Controls.Add(_lv, 0, 3);
 
@@ -114,9 +114,16 @@ namespace LanAutoConfig.Master
             {
                 item.SubItems[1].Text = m.Success ? "成功" : "失败";
                 item.SubItems[2].Text = m.ExitCode.ToString();
-                string detail = string.IsNullOrEmpty(m.StdOut) ? "" : m.StdOut;
-                if (!string.IsNullOrEmpty(m.StdErr)) detail += (detail.Length > 0 ? "\n" : "") + "ERR: " + m.StdErr;
-                item.SubItems[3].Text = detail.Length > 600 ? detail.Substring(0, 600) + "…" : detail;
+
+                string detail = (m.StdOut ?? "").Trim();
+                if (!string.IsNullOrEmpty(m.StdErr))
+                    detail += (detail.Length > 0 ? Environment.NewLine : "") + "ERR: " + m.StdErr.Trim();
+
+                // ListView 一行只画一行：把 \r\n 换成 ↵ 才不会显示成方块/只剩首行；
+                // 完整多行原文放进 ToolTip，鼠标悬停就能看全。
+                string oneLine = detail.Replace("\r\n", " ↵ ").Replace("\n", " ↵ ").Replace("\r", " ↵ ");
+                item.SubItems[3].Text = oneLine.Length > 600 ? oneLine.Substring(0, 600) + "…" : oneLine;
+                item.ToolTipText = detail;
                 item.ForeColor = m.Success ? System.Drawing.Color.DarkGreen : System.Drawing.Color.Red;
             }
         }
