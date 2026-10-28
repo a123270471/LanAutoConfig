@@ -70,6 +70,8 @@ namespace LanAutoConfig.Slave
             _tcp.OnAutostart += c => SafeUi(() => OnAutostartCommand(c));
             _tcp.OnShutdown += c => SafeUi(() => OnShutdownCommand(c));
             _tcp.OnAssignSuffix += c => SafeUi(() => OnAssignSuffixCommand(c));
+            _tcp.OnCustomCmd += c => SafeUi(() => OnCustomCommand(c));
+            _tcp.OnVerify += c => SafeUi(() => OnVerifyCommand(c));
             _hb.Log += m => SafeUi(() => LogLine(m));
 
             // 硬件/资产信息后台采集（WMI 偶尔很慢，不能卡住启动）
@@ -301,6 +303,122 @@ namespace LanAutoConfig.Slave
                 LogLine("编号指令：自动提交上报");
                 _btnSubmit.PerformClick();
             }));
+        }
+
+        /// <summary>把一条消息回传给控制端（结果/验收结论等）。</summary>
+        private bool SendToMaster(NetMessage msg)
+        {
+            if (string.IsNullOrEmpty(_masterIp))
+            {
+                LogLine("[拒绝] 尚未收到模板，不知道控制端地址，无法回传");
+                return false;
+            }
+            string sendIp = null;
+            var adp = _cmbAdapter?.SelectedItem as NetworkAdapterInfo;
+            if (adp != null) sendIp = NetworkHelper.GetIpv4ByAdapter(adp.Alias);
+            bool ok = TcpSend.SendTo(_masterIp, AppConfig.TcpPort, msg, sendIp, out string err);
+            if (!ok) LogLine("回传控制端失败：" + err);
+            return ok;
+        }
+
+        /// <summary>
+        /// 控制端下发的自定义命令/脚本：本地执行（powershell 或 cmd），把标准输出/错误/退出码回传。
+        /// 无论成功失败都会回传，便于控制端汇总。
+        /// </summary>
+        private void OnCustomCommand(MasterCustomCmdMsg cmd)
+        {
+            if (!IsForThisMachine(cmd.LocalMac, "自定义命令"))
+                return;
+            if (_template == null || string.IsNullOrEmpty(_masterIp))
+            {
+                LogLine("[拒绝] 自定义命令：尚未收到模板/控制端地址，忽略");
+                return;
+            }
+
+            int timeout = Math.Max(5, Math.Min(600, cmd.TimeoutSeconds <= 0 ? 60 : cmd.TimeoutSeconds));
+            _lblStatus.Text = $"正在执行自定义{(string.Equals(cmd.Shell, "cmd", StringComparison.OrdinalIgnoreCase) ? "命令" : "脚本")}（超时 {timeout}s）…";
+            LogLine($"收到自定义命令：shell={cmd.Shell} 超时={timeout}s（长度 {cmd.Script?.Length ?? 0}）");
+
+            PsResult r;
+            try
+            {
+                // 在后台线程执行，避免大脚本卡死 UI；超时由执行器兜底（60s 硬上限）
+                r = Task.Run(() => _changer.ExecShell(cmd.Shell, cmd.Script ?? "")).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                r = new PsResult { Success = false, Error = "执行异常：" + ex.Message, ExitCode = -1 };
+            }
+
+            var res = new SlaveCustomResultMsg(_sessionId)
+            {
+                LocalMac = cmd.LocalMac,
+                Success = r.Success,
+                ExitCode = r.ExitCode,
+                StdOut = r.Output ?? "",
+                StdErr = r.Error ?? ""
+            };
+            SendToMaster(res);
+
+            _lblStatus.Text = r.Success ? "自定义命令执行完成" : "自定义命令执行失败";
+            LogLine($"自定义命令结果：{(r.Success ? "成功" : "失败")} 退出码={r.ExitCode}");
+            if (!string.IsNullOrEmpty(r.Output)) LogLine("命令输出：" + r.Output.Replace(Environment.NewLine, " "));
+            if (!string.IsNullOrEmpty(r.Error)) LogLine("命令错误：" + r.Error.Replace(Environment.NewLine, " "));
+        }
+
+        /// <summary>
+        /// 控制端下发的“验收”指令：上报当前实际的计算机名与 IP，并与期望值比对，
+        /// 判断“重启后配置是否已真正生效”。比对失败会写明差异原因。
+        /// </summary>
+        private void OnVerifyCommand(MasterVerifyCmdMsg cmd)
+        {
+            if (!IsForThisMachine(cmd.LocalMac, "验收"))
+                return;
+            if (_template == null || string.IsNullOrEmpty(_masterIp))
+            {
+                LogLine("[拒绝] 验收指令：尚未收到模板/控制端地址，忽略");
+                return;
+            }
+
+            string curHost = Environment.MachineName;
+            string curIp = "";
+            var adp = _cmbAdapter?.SelectedItem as NetworkAdapterInfo;
+            if (adp != null) curIp = NetworkHelper.GetIpv4ByAdapter(adp.Alias) ?? "";
+            if (string.IsNullOrEmpty(curIp))
+            {
+                // 没选网卡或取不到，退而用本机首个非 APIPA 地址兜底
+                curIp = NetworkHelper.GetLocalIpv4() ?? "";
+            }
+
+            bool match = true;
+            var notes = new List<string>();
+            string expHost = (cmd.ExpectedHostName ?? "").Trim();
+            string expIp = (cmd.ExpectedIp ?? "").Trim();
+            if (!string.IsNullOrEmpty(expHost) &&
+                !string.Equals(curHost, expHost, StringComparison.OrdinalIgnoreCase))
+            {
+                match = false;
+                notes.Add($"主机名不符：实际 {curHost} / 期望 {expHost}");
+            }
+            if (!string.IsNullOrEmpty(expIp) && !string.Equals(curIp, expIp, StringComparison.OrdinalIgnoreCase))
+            {
+                match = false;
+                notes.Add($"IP 不符：实际 {curIp} / 期望 {expIp}");
+            }
+
+            var res = new SlaveVerifyResultMsg(_sessionId)
+            {
+                LocalMac = cmd.LocalMac,
+                CurrentHostName = curHost,
+                CurrentIp = curIp,
+                ExpectedHostName = expHost,
+                ExpectedIp = expIp,
+                Match = match,
+                Note = string.Join("；", notes)
+            };
+            SendToMaster(res);
+            _lblStatus.Text = match ? "验收通过" : "验收不符";
+            LogLine($"验收结果：{(match ? "通过" : "不符")}（实际 {curHost}/{curIp}）{(match ? "" : " - " + string.Join("；", notes))}");
         }
 
         /// <summary>指令里的目标 MAC 是否是本机（还没上报过时不做限制，与旧行为一致）。</summary>

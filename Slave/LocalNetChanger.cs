@@ -8,6 +8,8 @@ namespace LanAutoConfig.Slave
         public bool Success { get; set; }
         public string Output { get; set; }
         public string Error { get; set; }
+        /// <summary>进程退出码（0 = 正常；自定义命令/脚本可借此判断业务结果）。</summary>
+        public int ExitCode { get; set; }
         public override string ToString() => Success ? "成功" : $"失败: {Error}";
     }
 
@@ -275,6 +277,60 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
         }
 
         private static PsResult Fail(string msg) => new PsResult { Success = false, Error = msg };
+
+        /// <summary>
+        /// 执行控制端下发的自定义命令/脚本。
+        /// shell="powershell" 走本地 PowerShell（与原改网卡逻辑同一套执行器）；
+        /// 其它（如 "cmd"）走 cmd.exe /c。超时由调用方（被控端指令处理器）控制。
+        /// </summary>
+        public PsResult ExecShell(string shell, string code)
+        {
+            if (string.IsNullOrWhiteSpace(code)) return Fail("命令内容为空");
+            if (string.Equals(shell, "powershell", StringComparison.OrdinalIgnoreCase))
+                return RunPs(code);
+            return RunCmd(code);
+        }
+
+        /// <summary>用 cmd.exe /c 执行一段命令（用于“命令(cmd)”方式下发的脚本）。</summary>
+        private PsResult RunCmd(string command)
+        {
+            var result = new PsResult();
+            try
+            {
+                var psi = new ProcessStartInfo("cmd.exe")
+                {
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                    StandardOutputEncoding = new UTF8Encoding(false),
+                    StandardErrorEncoding = new UTF8Encoding(false),
+                    Arguments = "/c " + command
+                };
+                using var p = Process.Start(psi);
+                if (p == null) { result.Success = false; result.Error = "无法启动 cmd.exe"; return result; }
+
+                Task<string> outTask = p.StandardOutput.ReadToEndAsync();
+                Task<string> errTask = p.StandardError.ReadToEndAsync();
+                if (!p.WaitForExit(60000)) { try { p.Kill(true); } catch { } result.Success = false; result.Error = "命令执行超时（60 秒），已强制结束"; return result; }
+
+                result.Output = (outTask.GetAwaiter().GetResult() ?? "").Trim();
+                result.Error = (errTask.GetAwaiter().GetResult() ?? "").Trim();
+                result.ExitCode = p.ExitCode;
+                // cmd 的“成功”以退出码为准；但某些脚本即便有 stderr 仍算“跑完了”，所以只要退出码 0 就成功
+                result.Success = p.ExitCode == 0;
+                if (!result.Success && string.IsNullOrEmpty(result.Error) && !string.IsNullOrEmpty(result.Output))
+                    result.Error = result.Output;
+                return result;
+            }
+            catch (Exception ex)
+            {
+                result.Success = false;
+                result.Error = "启动命令失败：" + ex.Message;
+                return result;
+            }
+        }
 
         /// <summary>转义 PowerShell 单引号字符串内文本。</summary>
         private static string EscapePs(string s) => (s ?? "").Replace("'", "''");

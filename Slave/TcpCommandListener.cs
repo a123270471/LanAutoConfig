@@ -23,6 +23,10 @@ namespace LanAutoConfig.Slave
         public event Action<MasterShutdownCmdMsg> OnShutdown;
         /// <summary>收到“分配后缀编号”指令（批量装机用，收到后自动填编号并上报）。</summary>
         public event Action<MasterAssignSuffixCmdMsg> OnAssignSuffix;
+        /// <summary>收到“自定义命令/脚本下发”指令（运维用）。</summary>
+        public event Action<MasterCustomCmdMsg> OnCustomCmd;
+        /// <summary>收到“验收”指令：要求被控端上报当前实际配置。</summary>
+        public event Action<MasterVerifyCmdMsg> OnVerify;
         public event Action<string> Log;
 
         public void SetSessionId(string sid) => _currentSessionId = sid ?? "";
@@ -139,6 +143,16 @@ namespace LanAutoConfig.Slave
                     {
                         Log?.Invoke($"收到控制端编号指令：后缀 {asg.Suffix} MAC={asg.LocalMac}");
                         OnAssignSuffix?.Invoke(asg);
+                    }
+                    else if (msg is MasterCustomCmdMsg cc && cc.SessionId == sid)
+                    {
+                        Log?.Invoke($"收到控制端自定义命令：shell={cc.Shell} MAC={cc.LocalMac}");
+                        OnCustomCmd?.Invoke(cc);
+                    }
+                    else if (msg is MasterVerifyCmdMsg vc && vc.SessionId == sid)
+                    {
+                        Log?.Invoke($"收到控制端验收指令：期望 {vc.ExpectedHostName}/{vc.ExpectedIp} MAC={vc.LocalMac}");
+                        OnVerify?.Invoke(vc);
                     }
                     else
                     {

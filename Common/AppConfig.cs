@@ -88,6 +88,9 @@ namespace LanAutoConfig
         /// <summary>被控端界面偏好（开机自启开关等），与命令行参数分开存。</summary>
         public static string SlavePrefsPath => Path.Combine(DataDir, "slave-prefs.json");
 
+        /// <summary>控制端“模板方案库”持久化文件（多套模板方案）。</summary>
+        public static string TemplateLibraryPath => Path.Combine(DataDir, "templatelib.json");
+
         /// <summary>判断当前进程是否以管理员权限运行（被控端必须管理员）。</summary>
         public static bool IsAdministrator()
         {

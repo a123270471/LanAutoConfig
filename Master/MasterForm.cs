@@ -42,8 +42,27 @@ namespace LanAutoConfig.Master
         private TextBox _txtLog;
         private Button _btnExportLog, _btnBlacklist, _btnClearLog;
 
+        // 模板方案库 UI 控件
+        private ComboBox _cmbTemplateScheme;
+        private Button _btnSchemeSave, _btnSchemeApply, _btnSchemeDelete;
+
         // DHCP 服务（可选）
         private readonly DhcpServer _dhcp = new DhcpServer();
+
+        // ---- 本次新增功能相关字段 ----
+        /// <summary>模板方案库（多套命名模板，落盘 JSON）。</summary>
+        private readonly TemplateLibrary _templateLib = new TemplateLibrary(AppConfig.TemplateLibraryPath);
+        /// <summary>已下发重启、等待其重新上线后自动验收的 MAC 集合。</summary>
+        private readonly HashSet<string> _rebootSent = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        /// <summary>分批错峰重启的定时器（按间隔逐批发重启指令）。</summary>
+        private readonly System.Windows.Forms.Timer _staggerTimer = new System.Windows.Forms.Timer();
+        /// <summary>每台终端的上一次“在线”状态（用于检测离线→上线跳变，触发重启后自动验收）。</summary>
+        private readonly Dictionary<string, bool> _onlineState = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        /// <summary>打开的“自定义命令”对话框订阅此事件以接收回传结果。</summary>
+        private event Action<SlaveCustomResultMsg> _customResultHandlers;
+        /// <summary>分批重启待发送队列（由 _staggerTimer 逐批取出）。</summary>
+        private Queue<SlaveSessionItem> _rebootQueue;
+        private int _rebootBatchSize;
 
         private volatile bool _broadcasting;
         private volatile bool _dispatching;
@@ -86,6 +105,8 @@ namespace LanAutoConfig.Master
             _server.OnSlaveReport += r => SafeUi(() => OnSlaveReport(r));
             _server.OnResultReport += r => SafeUi(() => OnResultReport(r));
             _server.OnHeartbeat += r => SafeUi(() => OnHeartbeat(r));
+            _server.OnCustomResult += r => SafeUi(() => OnCustomResult(r));
+            _server.OnVerifyResult += r => SafeUi(() => OnVerifyResult(r));
 
             // 单独的心跳刷新定时器：只重画“在线”列与状态栏，不整表刷新（否则每 10 秒闪一次、还打断编辑）
             _onlineTimer.Interval = 5000;
@@ -106,6 +127,7 @@ namespace LanAutoConfig.Master
                 try { _sweepTimer.Stop(); } catch { }
                 try { _onlineTimer.Stop(); } catch { }
                 try { _saveTimer.Stop(); } catch { }
+                try { _staggerTimer.Stop(); } catch { }
                 SaveSettings();   // 退出前把模板参数与终端列表记下来
                 _broadcast.Stop();
                 _server.Stop();
@@ -168,6 +190,163 @@ namespace LanAutoConfig.Master
                 UpdateOnlineCell(hb.LocalMac);
                 UpdateStatusBar();
             }
+
+            // 重启后自动验收：本机刚下发过重启、现在又上线了（检测到这次心跳），自动补一条验收指令
+            if (_rebootSent.Contains(hb.LocalMac))
+            {
+                _rebootSent.Remove(hb.LocalMac);
+                var it = _session.GetByMac(hb.LocalMac);
+                if (it != null)
+                {
+                    SendVerifyTo(it);
+                }
+            }
+            // 记录在线状态，供后续检测“离线→上线”跳变（预留）
+            _onlineState[hb.LocalMac] = true;
+        }
+
+        // ---------- 自定义命令 / 验收 ----------
+
+        /// <summary>被控端回传的自定义命令执行结果：写日志并转发给打开的对话框。</summary>
+        private void OnCustomResult(SlaveCustomResultMsg m)
+        {
+            var it = _session.GetByMac(m.LocalMac);
+            string name = it?.TargetHostName ?? m.LocalMac;
+            LogLine($"[自定义命令结果] {name}（{m.LocalMac}）：{(m.Success ? "成功" : "失败")} 退出码={m.ExitCode}");
+            if (!string.IsNullOrEmpty(m.StdOut)) LogLine("  输出：" + m.StdOut.Replace("\r\n", " ").Replace("\n", " "));
+            if (!string.IsNullOrEmpty(m.StdErr)) LogLine("  错误：" + m.StdErr.Replace("\r\n", " ").Replace("\n", " "));
+            _customResultHandlers?.Invoke(m);
+        }
+
+        /// <summary>被控端回传的验收结果：更新列表的“验收”列并刷新。</summary>
+        private void OnVerifyResult(SlaveVerifyResultMsg m)
+        {
+            var it = _session.GetByMac(m.LocalMac);
+            if (it == null) return;
+            it.VerifyStatus = m.Match ? VerifyStatus.Pass : VerifyStatus.Fail;
+            it.VerifyActual = $"{(m.CurrentHostName ?? "")} / {(m.CurrentIp ?? "")}";
+            it.VerifyNote = m.Note ?? "";
+            RefreshGrid();
+            string name = it.TargetHostName ?? m.LocalMac;
+            LogLine($"[验收] {name}（{m.LocalMac}）：{(m.Match ? "通过" : "不符")}（实际 {m.CurrentHostName}/{m.CurrentIp}）{(m.Match ? "" : " - " + m.Note)}");
+        }
+
+        /// <summary>供“自定义命令”对话框订阅结果回传；关闭时取消订阅。</summary>
+        internal void RegisterCustomResultHandler(Action<SlaveCustomResultMsg> h) => _customResultHandlers += h;
+        internal void UnregisterCustomResultHandler(Action<SlaveCustomResultMsg> h) => _customResultHandlers -= h;
+
+        /// <summary>当前选中的终端；未选中则取所有在线终端（用于“对全部在线下发”）。</summary>
+        internal List<SlaveSessionItem> SelectedItemsOrAllOnline()
+        {
+            var sel = SelectedItems();
+            if (sel.Count > 0) return sel;
+            return _session.Items.Where(x => x.Online).ToList();
+        }
+
+        /// <summary>向单台终端下发自定义命令/脚本。</summary>
+        internal void SendCustomCommandTo(SlaveSessionItem it, string shell, string script, int timeout)
+        {
+            var sid = _session.SessionId;
+            var bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
+            var cmd = new MasterCustomCmdMsg(sid) { LocalMac = it.Mac, Shell = shell, Script = script, TimeoutSeconds = timeout };
+            string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
+            if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err))
+                LogLine($"已下发自定义命令到 {it.TargetHostName ?? it.Mac}（{it.Mac}）");
+            else
+                LogLine($"下发自定义命令失败：{it.Mac} - {err}");
+        }
+
+        /// <summary>向单台终端下发验收指令（期望配置来自该终端当前的目标值）。</summary>
+        internal void SendVerifyTo(SlaveSessionItem it)
+        {
+            var sid = _session.SessionId;
+            var bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
+            var cmd = new MasterVerifyCmdMsg(sid)
+            {
+                LocalMac = it.Mac,
+                ExpectedHostName = it.TargetHostName ?? "",
+                ExpectedIp = it.TargetIp ?? ""
+            };
+            string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
+            if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err))
+                LogLine($"已下发验收指令：{it.TargetHostName ?? it.Mac}（期望 {it.TargetHostName}/{it.TargetIp}）");
+            else
+                LogLine($"下发验收失败：{it.Mac} - {err}");
+        }
+
+        /// <summary>手动验收选中终端（未选中则验收全部在线终端）。</summary>
+        private void VerifySelected()
+        {
+            var targets = SelectedItems();
+            if (targets.Count == 0) targets = _session.Items.Where(x => x.Online).ToList();
+            if (targets.Count == 0) { MessageBox.Show("没有可验收的在线终端。", "提示"); return; }
+            int n = 0;
+            foreach (var it in targets)
+            {
+                if (string.IsNullOrEmpty(it.TargetHostName) && string.IsNullOrEmpty(it.TargetIp)) continue;
+                SendVerifyTo(it);
+                n++;
+            }
+            LogLine($"已向 {n} 台终端下发验收指令");
+        }
+
+        // ---------- 模板方案库 ----------
+
+        /// <summary>刷新模板方案下拉框。</summary>
+        private void RefreshSchemeList()
+        {
+            if (_cmbTemplateScheme == null) return;
+            string cur = _cmbTemplateScheme.Text;
+            _cmbTemplateScheme.Items.Clear();
+            foreach (var s in _templateLib.List())
+                _cmbTemplateScheme.Items.Add(s.Name);
+            if (!string.IsNullOrEmpty(cur)) _cmbTemplateScheme.Text = cur;
+        }
+
+        /// <summary>把当前模板参数存成一个命名方案（弹出输入框要名字）。</summary>
+        private void SchemeSave()
+        {
+            string name = Prompt("保存模板方案", "方案名称（如 “3楼A区-静态IP” / “5楼-DHCP”）：");
+            if (string.IsNullOrWhiteSpace(name)) return;
+            name = name.Trim();
+            var t = BuildTemplateFromUi();
+            if (t == null) return;   // 校验失败已弹窗提示
+            _templateLib.Save(name, t);
+            RefreshSchemeList();
+            if (_cmbTemplateScheme != null) _cmbTemplateScheme.Text = name;
+            LogLine($"已保存模板方案：{name}");
+        }
+
+        /// <summary>把下拉框选中的方案应用到当前模板参数。</summary>
+        private void SchemeApply()
+        {
+            if (_cmbTemplateScheme == null) return;
+            string name = _cmbTemplateScheme.Text?.Trim();
+            if (string.IsNullOrEmpty(name)) { MessageBox.Show("请先在上方选择或输入一个方案名称。", "提示"); return; }
+            var s = _templateLib.Get(name);
+            if (s == null || s.Template == null) { MessageBox.Show($"找不到方案「{name}」。", "提示"); return; }
+            var t = s.Template;
+            _txtIpPrefix.Text = t.IpPrefix ?? "";
+            _txtMask.Text = t.SubnetMask ?? "";
+            _txtGw.Text = t.Gateway ?? "";
+            _txtDns1.Text = t.Dns1 ?? "";
+            _txtDns2.Text = t.Dns2 ?? "";
+            _txtHnPrefix.Text = t.HostNamePrefix ?? "";
+            _chkDhcp.Checked = t.IsDhcp;
+            LogLine($"已应用模板方案：{name}");
+            ScheduleSave();
+        }
+
+        /// <summary>删除下拉框选中的方案。</summary>
+        private void SchemeDelete()
+        {
+            if (_cmbTemplateScheme == null) return;
+            string name = _cmbTemplateScheme.Text?.Trim();
+            if (string.IsNullOrEmpty(name)) { MessageBox.Show("请先选择要删除的方案。", "提示"); return; }
+            if (MessageBox.Show($"确认删除方案「{name}」？", "删除方案", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            _templateLib.Delete(name);
+            RefreshSchemeList();
+            LogLine($"已删除模板方案：{name}");
         }
 
         /// <summary>只刷某台终端的「在线」单元格（收到心跳时立即调用）。</summary>
@@ -198,6 +377,12 @@ namespace LanAutoConfig.Master
                 return;
             }
             var rec = _session.MarkResult(m);
+            // 成功后清掉上一次失败留下的归类，避免“已成功却还显示旧错误类别”
+            if (m.Success)
+            {
+                var okIt = _session.GetByMac(m.LocalMac);
+                if (okIt != null) { okIt.FailCategory = ""; okIt.FailSuggestion = ""; }
+            }
             if (rec != null)
             {
                 _db.Insert(rec);
@@ -206,6 +391,18 @@ namespace LanAutoConfig.Master
             else
             {
                 LogLine($"[结果] 收到未知终端 {m.LocalMac} 的执行结果，未匹配到列表项");
+            }
+
+            // 失败原因归类：把被控端回传的错误原文映射成“问题类别 + 修复建议”，落到列表“失败归类”列
+            if (!m.Success)
+            {
+                var it = _session.GetByMac(m.LocalMac);
+                if (it != null)
+                {
+                    var fc = FailureClassifier.Classify(m.ErrorMsg);
+                    it.FailCategory = fc.Category;
+                    it.FailSuggestion = fc.Suggestion;
+                }
             }
         }
 
@@ -505,6 +702,32 @@ namespace LanAutoConfig.Master
             return list;
         }
 
+        /// <summary>供对话框读取当前选中终端。</summary>
+        internal List<SlaveSessionItem> GetSelectedItems() => SelectedItems();
+        /// <summary>供对话框读取全部终端。</summary>
+        internal List<SlaveSessionItem> GetAllItems() => _session.Items.ToList();
+
+        private void ShowCustomCmdDialog()
+        {
+            using var dlg = new CustomCmdForm(this);
+            dlg.ShowDialog(this);
+        }
+
+        private void ShowStaggerRebootDialog()
+        {
+            var targets = SelectedItems();
+            int online = targets.Count > 0 ? targets.Count : _session.Items.Count(x => x.Online);
+            using var dlg = new StaggerRebootForm(online);
+            if (dlg.ShowDialog(this) == DialogResult.OK)
+                BatchRebootStaggered(dlg.BatchSize, dlg.IntervalSeconds);
+        }
+
+        private void ShowLabelPrintDialog()
+        {
+            using var dlg = new LabelPrintForm(this);
+            dlg.ShowDialog(this);
+        }
+
         private void BatchDeleteSelected()
         {
             var items = SelectedItems();
@@ -612,20 +835,75 @@ namespace LanAutoConfig.Master
             if (MessageBox.Show($"确认重启选中的 {items.Count} 台终端？（10 秒后重启）", "确认",
                     MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
 
-            string sid = _session.SessionId;
-            string bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
             int ok = 0, fail = 0;
             foreach (var it in items)
             {
-                string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
-                if (string.IsNullOrEmpty(target)) { fail++; continue; }
-                var cmd = new MasterRebootCmdMsg(sid) { LocalMac = it.Mac, DelaySeconds = 10 };
-                if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err)) ok++;
-                else { fail++; LogLine($"[重启] {it.TargetHostName}（{target}）下发失败：{err}"); }
+                if (SendRebootTo(it, 10)) ok++; else fail++;
             }
             LogLine($"批量重启：成功下发 {ok} 台，失败 {fail} 台");
             MessageBox.Show($"已下发重启：成功 {ok} 台，失败 {fail} 台（详见日志）。", "批量重启",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        /// <summary>向单台终端下发重启指令，并登记到“待自动验收”集合（重启上线后自动补验收）。</summary>
+        private bool SendRebootTo(SlaveSessionItem it, int delaySeconds)
+        {
+            string sid = _session.SessionId;
+            string bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
+            string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
+            if (string.IsNullOrEmpty(target))
+            {
+                LogLine($"[重启] {it.TargetHostName}（{it.Mac}）无可用目标地址，跳过");
+                return false;
+            }
+            var cmd = new MasterRebootCmdMsg(sid) { LocalMac = it.Mac, DelaySeconds = Math.Max(0, Math.Min(600, delaySeconds)) };
+            if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err))
+            {
+                _rebootSent.Add(it.Mac);
+                LogLine($"[重启] 已下发：{it.TargetHostName}（{target}）");
+                return true;
+            }
+            LogLine($"[重启] {it.TargetHostName}（{target}）下发失败：{err}");
+            return false;
+        }
+
+        /// <summary>分批错峰重启：把选中的（或全部在线）终端分多批，每批间隔若干秒下发重启。</summary>
+        private void BatchRebootStaggered(int batchSize, int intervalSec)
+        {
+            var targets = SelectedItems();
+            if (targets.Count == 0) targets = _session.Items.Where(x => x.Online).ToList();
+            if (targets.Count == 0) { MessageBox.Show("没有可选重启的在线终端。", "提示"); return; }
+            if (MessageBox.Show($"将分批错峰重启 {targets.Count} 台：\n每批 {batchSize} 台，批次间隔 {intervalSec} 秒。确认？",
+                    "分批错峰重启", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
+
+            _rebootQueue = new Queue<SlaveSessionItem>(targets);
+            _rebootBatchSize = Math.Max(1, batchSize);
+            _staggerTimer.Interval = Math.Max(1000, intervalSec * 1000);
+            _staggerTimer.Tick -= StaggerTick;
+            _staggerTimer.Tick += StaggerTick;
+            LogLine($"开始分批错峰重启：共 {targets.Count} 台，每批 {_rebootBatchSize} 台，间隔 {_staggerTimer.Interval / 1000} 秒");
+            StaggerTick(null, null);   // 立即发第一批
+            _staggerTimer.Start();
+        }
+
+        /// <summary>每到一个批次间隔，从队列里取出本批终端下发重启。</summary>
+        private void StaggerTick(object sender, EventArgs e)
+        {
+            if (_rebootQueue == null) { _staggerTimer.Stop(); return; }
+            int n = 0;
+            while (_rebootQueue.Count > 0 && n < _rebootBatchSize)
+            {
+                var it = _rebootQueue.Dequeue();
+                SendRebootTo(it, 10);
+                n++;
+            }
+            LogLine($"本批已下发重启 {n} 台，剩余 {_rebootQueue.Count} 台");
+            if (_rebootQueue.Count == 0)
+            {
+                _staggerTimer.Stop();
+                _rebootQueue = null;
+                LogLine("分批错峰重启已全部下发完毕（机器会按各自倒计时重启，上线后会自动验收）");
+            }
         }
 
         /// <summary>
@@ -975,17 +1253,28 @@ namespace LanAutoConfig.Master
                 foreach (var it in items)
                 {
                     bool conflict = confIps.Contains(it.TargetIp) || confHosts.Contains(it.TargetHostName ?? "");
+                    string verifyText = it.VerifyStatus == VerifyStatus.Pass ? "✅ 通过"
+                        : it.VerifyStatus == VerifyStatus.Fail ? "❌ 不符" : "—";
                     int idx = _grid.Rows.Add(
                         it.Mac, it.OnlineDisplay, it.SourceIp, it.Suffix, it.TargetHostName, it.TargetIp,
                         it.SubnetMask, it.Gateway, it.Dns1, it.Dns2,
                         it.IsDhcp ? "DHCP" : "静态",
-                        it.StatusDisplay, it.ErrorMsg, conflict ? "冲突" : "");
+                        it.StatusDisplay, it.ErrorMsg, conflict ? "冲突" : "",
+                        verifyText, it.FailCategory ?? "");
                     var row = _grid.Rows[idx];
                     row.Tag = it;
                     if (conflict) row.DefaultCellStyle.BackColor = System.Drawing.Color.LightSalmon;
                     if (it.Status == SlaveStatus.Failed) row.DefaultCellStyle.ForeColor = System.Drawing.Color.Red;
                     if (it.Status == SlaveStatus.Skipped) row.DefaultCellStyle.BackColor = System.Drawing.Color.Gainsboro;
                     if (!it.Online) row.Cells["colOnline"].Style.ForeColor = System.Drawing.Color.Gray;
+                    if (it.VerifyStatus == VerifyStatus.Pass) row.Cells["colVerify"].Style.ForeColor = System.Drawing.Color.Green;
+                    if (it.VerifyStatus == VerifyStatus.Fail)
+                    {
+                        row.Cells["colVerify"].Style.ForeColor = System.Drawing.Color.Red;
+                        row.Cells["colVerify"].ToolTipText = it.VerifyNote ?? "";
+                    }
+                    if (!string.IsNullOrEmpty(it.FailSuggestion))
+                        row.Cells["colFailCat"].ToolTipText = it.FailSuggestion;
                     // 资产摘要挂在 MAC 单元格的提示上，点开不占列宽
                     if (!string.IsNullOrEmpty(it.HardwareSummary))
                         row.Cells["colMac"].ToolTipText =
@@ -1320,10 +1609,11 @@ namespace LanAutoConfig.Master
             // ==================== Tab1 模板配置 ====================
             _tabTemplates = new TabPage("模板配置") { Padding = new Padding(10) };
 
-            var root1 = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5 };
+            var root1 = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6 };
             root1.RowStyles.Add(new RowStyle(SizeType.Absolute, 112));
-            root1.RowStyles.Add(new RowStyle(SizeType.Absolute, 206));
+            root1.RowStyles.Add(new RowStyle(SizeType.Absolute, 200));
             root1.RowStyles.Add(new RowStyle(SizeType.Absolute, 106));
+            root1.RowStyles.Add(new RowStyle(SizeType.Absolute, 96));   // 模板方案库
             root1.RowStyles.Add(new RowStyle(SizeType.Absolute, 92));
             root1.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
@@ -1415,6 +1705,27 @@ namespace LanAutoConfig.Master
             gbDhcp.Controls.Add(pnlDhcp2);
             gbDhcp.Controls.Add(pnlDhcp1);
 
+            // --- 模板方案库（多套命名模板，一键切换 / 保存） ---
+            var gbScheme = new GroupBox { Text = "模板方案库（多套参数一键切换）", Dock = DockStyle.Fill };
+            var pnlScheme = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(12, 10, 12, 0), WrapContents = false };
+            pnlScheme.Controls.Add(new Label { Text = "方案：", AutoSize = true, Margin = new Padding(0, 7, 4, 0) });
+            _cmbTemplateScheme = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown, Width = 260, Margin = new Padding(0, 3, 10, 0) };
+            pnlScheme.Controls.Add(_cmbTemplateScheme);
+            _btnSchemeApply = new Button { Text = "应用", Width = 80, Height = 30 };
+            _btnSchemeApply.Click += (s, e) => SchemeApply();
+            _btnSchemeSave = new Button { Text = "另存为…", Width = 90, Height = 30 };
+            _btnSchemeSave.Click += (s, e) => SchemeSave();
+            _btnSchemeDelete = new Button { Text = "删除", Width = 80, Height = 30 };
+            _btnSchemeDelete.Click += (s, e) => SchemeDelete();
+            pnlScheme.Controls.Add(_btnSchemeApply);
+            pnlScheme.Controls.Add(_btnSchemeSave);
+            pnlScheme.Controls.Add(_btnSchemeDelete);
+            var tipScheme = new ToolTip();
+            tipScheme.SetToolTip(_btnSchemeApply, "把下拉框选中的方案参数填到上面的模板里");
+            tipScheme.SetToolTip(_btnSchemeSave, "把当前模板参数保存成一个命名方案（可输入新名字另存）");
+            tipScheme.SetToolTip(_btnSchemeDelete, "删除下拉框选中的方案");
+            gbScheme.Controls.Add(pnlScheme);
+
             // --- 黑名单 / 白名单 ---
             var gbBlack = new GroupBox { Text = "名单（黑名单拒绝 / 白名单放行）", Dock = DockStyle.Fill };
             var pnlBlack = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 44, Padding = new Padding(10, 8, 10, 0), WrapContents = false };
@@ -1431,9 +1742,13 @@ namespace LanAutoConfig.Master
             root1.Controls.Add(gbRun, 0, 0);
             root1.Controls.Add(gbParams, 0, 1);
             root1.Controls.Add(gbDhcp, 0, 2);
-            root1.Controls.Add(gbBlack, 0, 3);
-            root1.Controls.Add(new Panel { Dock = DockStyle.Fill }, 0, 4);   // 底部留白，避免黑名单被拉高
+            root1.Controls.Add(gbScheme, 0, 3);
+            root1.Controls.Add(gbBlack, 0, 4);
+            root1.Controls.Add(new Panel { Dock = DockStyle.Fill }, 0, 5);   // 底部留白，避免名单被拉高
             _tabTemplates.Controls.Add(root1);
+
+            // 模板方案库：启动时填充下拉框
+            RefreshSchemeList();
 
             // ==================== Tab2 终端列表 ====================
             var tab2 = new TabPage("终端列表") { Padding = new Padding(10) };
@@ -1488,6 +1803,24 @@ namespace LanAutoConfig.Master
             bar2.Controls.Add(btnAutostartOn);
             bar2.Controls.Add(btnAutostartOff);
 
+            // ---- 第三行：自定义命令 / 分批重启 / 验收 / 标签打印 ----
+            var btnCustomCmd = new Button { Text = "自定义命令", Width = 100, Height = 32 };
+            btnCustomCmd.Click += (s, e) => ShowCustomCmdDialog();
+            var btnStagger = new Button { Text = "分批错峰重启", Width = 120, Height = 32 };
+            btnStagger.Click += (s, e) => ShowStaggerRebootDialog();
+            var btnVerify = new Button { Text = "验收选中", Width = 100, Height = 32 };
+            btnVerify.Click += (s, e) => VerifySelected();
+            var btnLabel = new Button { Text = "标签打印", Width = 100, Height = 32 };
+            btnLabel.Click += (s, e) => ShowLabelPrintDialog();
+            tipBar.SetToolTip(btnCustomCmd, "向选中终端（未选中则全部在线）下发 PowerShell / CMD 脚本或命令，并收回结果");
+            tipBar.SetToolTip(btnStagger, "把选中终端分多批、每批间隔若干秒下发重启，避免同时重启压垮交换机/域控；上线后自动验收");
+            tipBar.SetToolTip(btnVerify, "向选中终端（未选中则全部在线）下发验收指令，比对实际计算机名/IP 与期望值");
+            tipBar.SetToolTip(btnLabel, "生成资产标签（主机名/IP/MAC）网页，用浏览器打印到标签纸或 A4");
+            bar2.Controls.Add(btnCustomCmd);
+            bar2.Controls.Add(btnStagger);
+            bar2.Controls.Add(btnVerify);
+            bar2.Controls.Add(btnLabel);
+
             _lblGridHint = new Label
             {
                 Text = "提示：可多选（Ctrl/Shift），右键批量删除/标记；双击“目标主机名 / 目标 IP”可直接改",
@@ -1525,6 +1858,8 @@ namespace LanAutoConfig.Master
             _grid.Columns.Add("colStatus", "状态");
             _grid.Columns.Add("colErr", "错误信息");
             _grid.Columns.Add("colConf", "冲突");
+            _grid.Columns.Add("colVerify", "验收");
+            _grid.Columns.Add("colFailCat", "失败归类");
             // DataGridView.ReadOnly=true 会覆盖列设置，所以这里逐列控制
             foreach (DataGridViewColumn col in _grid.Columns) col.ReadOnly = true;
             _grid.Columns[cHost].ReadOnly = false;

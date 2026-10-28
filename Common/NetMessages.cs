@@ -16,6 +16,10 @@ namespace LanAutoConfig.Common
         public const string MasterAutostartCmd = "MasterAutostartCmd"; // TCP：控制端批量开关“开机自启动”
         public const string MasterShutdownCmd  = "MasterShutdownCmd";  // TCP：控制端下发“关闭本机”
         public const string MasterAssignSuffix = "MasterAssignSuffixCmd"; // TCP：控制端下发后缀编号，被控端自动上报
+        public const string MasterCustomCmd   = "MasterCustomCmd";   // TCP：控制端下发自定义命令/脚本
+        public const string SlaveCustomResult = "SlaveCustomResult"; // TCP：被控端回传自定义命令执行结果
+        public const string MasterVerifyCmd   = "MasterVerifyCmd";   // TCP：控制端要求被控端上报当前实际配置（用于重启后自动验收）
+        public const string SlaveVerifyResult = "SlaveVerifyResult"; // TCP：被控端回传当前实际配置
     }
 
     /// <summary>
@@ -231,6 +235,70 @@ namespace LanAutoConfig.Common
         protected override string StableBody() => $"{LocalMac}|{Suffix}";
     }
 
+    /// <summary>
+    /// 6.11 MasterCustomCmd：控制端向被控端下发自定义命令 / 脚本（运维用，操作员主动触发）。
+    /// Shell 区分 powershell / cmd；脚本内容原样下发，被控端本地执行后回传标准输出/错误/退出码。
+    /// </summary>
+    public class MasterCustomCmdMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        /// <summary>"powershell" 或 "cmd"，被控端据此选择执行器。</summary>
+        public string Shell { get; set; }
+        /// <summary>要执行的脚本/命令原文（UTF-8）。</summary>
+        public string Script { get; set; }
+        /// <summary>超时秒数（被控端据此限制执行时长，默认 60）。</summary>
+        public int TimeoutSeconds { get; set; }
+
+        public MasterCustomCmdMsg() : base() { }
+        public MasterCustomCmdMsg(string sessionId) : base(MsgTypes.MasterCustomCmd, sessionId) { }
+        protected override string StableBody() => $"{LocalMac}|{Shell}|{Script?.Length ?? 0}|{TimeoutSeconds}";
+    }
+
+    /// <summary>6.12 SlaveCustomResult：被控端回传自定义命令执行结果。</summary>
+    public class SlaveCustomResultMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        public bool Success { get; set; }
+        public int ExitCode { get; set; }
+        public string StdOut { get; set; }
+        public string StdErr { get; set; }
+
+        public SlaveCustomResultMsg() : base() { }
+        public SlaveCustomResultMsg(string sessionId) : base(MsgTypes.SlaveCustomResult, sessionId) { }
+        protected override string StableBody() => $"{LocalMac}|{Success}|{ExitCode}|{StdOut?.Length ?? 0}|{StdErr?.Length ?? 0}";
+    }
+
+    /// <summary>
+    /// 6.13 MasterVerifyCmd：控制端要求被控端上报“当前实际的计算机名与 IP”，用于重启后自动验收。
+    /// 被控端比对实际值与期望值后回传 Match，控制端据此标记验收通过/不符。
+    /// </summary>
+    public class MasterVerifyCmdMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        public string ExpectedHostName { get; set; }
+        public string ExpectedIp { get; set; }
+
+        public MasterVerifyCmdMsg() : base() { }
+        public MasterVerifyCmdMsg(string sessionId) : base(MsgTypes.MasterVerifyCmd, sessionId) { }
+        protected override string StableBody() => $"{LocalMac}|{ExpectedHostName}|{ExpectedIp}";
+    }
+
+    /// <summary>6.14 SlaveVerifyResult：被控端回传当前实际配置与验收结论。</summary>
+    public class SlaveVerifyResultMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        public string CurrentHostName { get; set; }
+        public string CurrentIp { get; set; }
+        public string ExpectedHostName { get; set; }
+        public string ExpectedIp { get; set; }
+        public bool Match { get; set; }
+        public string Note { get; set; }
+
+        public SlaveVerifyResultMsg() : base() { }
+        public SlaveVerifyResultMsg(string sessionId) : base(MsgTypes.SlaveVerifyResult, sessionId) { }
+        protected override string StableBody() => $"{LocalMac}|{CurrentHostName}|{CurrentIp}|{ExpectedHostName}|{ExpectedIp}|{Match}|{Note?.Length ?? 0}";
+    }
+
     /// <summary>JSON 序列化 / 反序列化助手（统一 UTF-8，PascalCase 字段与文档一致）。</summary>
     public static class JsonHelper
     {
@@ -267,6 +335,10 @@ namespace LanAutoConfig.Common
                     MsgTypes.MasterAutostartCmd => JsonSerializer.Deserialize<MasterAutostartCmdMsg>(json, Opts),
                     MsgTypes.MasterShutdownCmd  => JsonSerializer.Deserialize<MasterShutdownCmdMsg>(json, Opts),
                     MsgTypes.MasterAssignSuffix => JsonSerializer.Deserialize<MasterAssignSuffixCmdMsg>(json, Opts),
+                    MsgTypes.MasterCustomCmd    => JsonSerializer.Deserialize<MasterCustomCmdMsg>(json, Opts),
+                    MsgTypes.SlaveCustomResult  => JsonSerializer.Deserialize<SlaveCustomResultMsg>(json, Opts),
+                    MsgTypes.MasterVerifyCmd    => JsonSerializer.Deserialize<MasterVerifyCmdMsg>(json, Opts),
+                    MsgTypes.SlaveVerifyResult  => JsonSerializer.Deserialize<SlaveVerifyResultMsg>(json, Opts),
                     _ => null
                 };
                 return msg;

@@ -39,6 +39,14 @@ namespace LanAutoConfig.Common
             => $"{Cpu}|{CpuCores}|{MemoryBytes}|{DiskBytes}|{DiskModel}|{BaseBoard}|{SerialNumber}|{BiosVersion}|{BiosDate}|{Manufacturer}|{Model}|{OsVersion}|{MachineName}";
     }
 
+    /// <summary>验收状态（重启后自动验收 / 手动验收的结论）。</summary>
+    public enum VerifyStatus
+    {
+        None = 0,   // 未验收
+        Pass = 1,   // 验收通过（实际配置与期望一致）
+        Fail = 2    // 验收不符（实际配置与期望不一致）
+    }
+
     /// <summary>控制端内存会话实体（对应文档 7 节 SlaveSessionItem）。</summary>
     public class SlaveSessionItem
     {
@@ -98,6 +106,17 @@ namespace LanAutoConfig.Common
                 return string.Join(" / ", parts);
             }
         }
+
+        /// <summary>最后一次验收结论（None/Pass/Fail）。</summary>
+        public VerifyStatus VerifyStatus { get; set; } = VerifyStatus.None;
+        /// <summary>验收时回传的实际计算机名 / IP（用于不符时排查）。</summary>
+        public string VerifyActual { get; set; }
+        /// <summary>验收备注（如“主机名不符：实际 A / 期望 B”）。</summary>
+        public string VerifyNote { get; set; }
+        /// <summary>失败原因归类（由 FailureClassifier 产出，空表示成功或尚未归类）。</summary>
+        public string FailCategory { get; set; }
+        /// <summary>失败归类对应的修复建议。</summary>
+        public string FailSuggestion { get; set; }
 
         /// <summary>从被控端上报消息填充（保留已存在项的状态与错误，状态由 SessionManager 决定）。</summary>
         public void ApplyReport(SlaveReportMsg m)

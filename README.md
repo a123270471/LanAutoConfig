@@ -386,3 +386,46 @@ v3.0（资产 / 在线状态 / 白名单，本轮进行中）：
     - 被控端会拒绝三种情况并写日志：没收到模板（算不出主机名/IP）、已经上报过（改号会和控制端列表打架）、
       后缀非法或换算出的 IP 越界；
     - 兼容性：新消息类型不改动已有消息体，`Magic` 仍是 `LANAC-V3`；老被控端收到只会记一条“无法解析”后丢弃。
+62. **多套模板方案库**（`Common/TemplateLibrary.cs`、`Common/AppConfig.cs`、`Master/MasterForm.cs`）：
+    - 现场常有几种装机方案（如“财务网段”“研发网段”“DMZ 网段”），每套的主机名规则/IP 段/网关/DNS 都不同，
+      原本只能手工在一张模板上反复改；现在支持把当前“模板设置”**另存为命名方案**，随时一键切换；
+    - 方案落盘到 `%AppData%\LanAutoConfig\templatelib.json`（不可写时降级到程序目录 `data\`），格式 `TemplateScheme{ Name, Template, SavedAt }`；
+    - 控制端“模板设置”页新增【模板方案库】分组：下拉选方案 →【应用】把该方案的模板灌回所有输入框；【另存为】以当前输入框内容新存一个方案；【删除】删掉选中方案；
+    - 写盘走“临时文件 + 改名替换”，避免写到一半断电/崩溃留下半截 JSON；
+    - 纯字符串/JSON 实现，不依赖第三方库，单文件自包含发布不受影响。
+63. **自定义命令/脚本下发 ★**（`Common/NetMessages.cs`、`Slave/LocalNetChanger.cs`、`Slave/TcpCommandListener.cs`、
+    `Slave/SlaveForm.cs`、`Master/CustomCmdForm.cs`、`Master/MasterForm.cs`）：
+    - 现场难免要临时跑点东西——查网卡驱动版本、拉个注册表、批量装个小工具——又不想每台 RDP 上去手敲；
+    - 控制端【自定义命令】对话框支持**选 PowerShell 或 CMD** 两种外壳，填脚本正文 + 超时（秒），对选中终端或“全部在线”一键下发；
+    - 被控端收到 `MasterCustomCmdMsg`（`{ LocalMac, Shell, Script, TimeoutSeconds }`）后，校验 `LocalMac` 确实是本机才执行，
+      否则只在本地日志记一条“拒绝”防止误跑；PowerShell 走 `powershell.exe -EncodedCommand`，其它走 `cmd.exe /c`；
+    - 执行结果 `SlaveCustomResultMsg`（`{ LocalMac, Success, ExitCode, StdOut, StdErr }`）回传控制端，
+      对话框里按终端列出退出码与标准输出/错误输出，方便当场核对；
+    - 超时或被控端不支持该消息（老版本）都不会让控制端卡住：老端不认识 `MasterCustomCmdMsg` 直接丢弃，无回传，控制端等超时显示“无结果”。
+64. **分批错峰重启**（`Master/MasterForm.cs`、`Master/StaggerRebootForm.cs`）：
+    - 几十上百台同时重启会把接入交换机、域控、DHCP 一瞬间打爆，登录风暴能拖到十几分钟；错峰重启让每批只重启一小撮；
+    - 终端列表工具条第三行【分批错峰重启】弹出设置框：填“每批台数”和“批次间隔（秒）”，例如每批 10 台、间隔 30 秒；
+    - 内部用 `BatchRebootStaggered` + 一个 `System.Windows.Forms.Timer` 节拍：每到一个节拍就取下一批、对这批每台调 `SendRebootTo`
+      （和【批量重启】同一套指令，只是分批触发），全部发完自动停表；
+    - 与【批量重启】的区别仅在于“是否分批”，单批（每批=总数）即退化为一次性重启；重启指令本身仍带 `DelaySeconds` 缓冲。
+65. **重启后自动验收 ★**（`Common/NetMessages.cs`、`Common/Models.cs`、`Slave/SlaveForm.cs`、`Master/MasterForm.cs`、`Master/TcpServerService.cs`）：
+    - 装机改完主机名/IP 后必须确认“重启真的生效了、且改对了”，否则设备上线后才发现名字还是旧的，再返工更贵；
+    - 控制端在发重启指令时把该终端 MAC 登记进 `_rebootSent` 集合；被控端重启后重新上线、心跳到达控制端时，
+      控制端发现 MAC 在集合里就移除它并自动下发 `MasterVerifyCmd`（`{ LocalMac, ExpectedHostName, ExpectedIp }`）；
+    - 被控端取本机 `Environment.MachineName` 与当前 IPv4 回传 `SlaveVerifyResultMsg`
+      （`{ CurrentHostName, CurrentIp, ExpectedHostName, ExpectedIp, Match, Note }`）；
+    - 网格新增「验收」列：比对一致显示 ✅ 绿、不一致显示 ❌ 红，鼠标悬停看「期望 / 实际 / 备注」；
+      状态写入 `SlaveSessionItem.VerifyStatus`，跟着会话持久化，不用每次重启都重验。
+66. **执行失败原因归类**（`Common/FailureClassifier.cs`、`Master/MasterForm.cs`、`Common/Models.cs`）：
+    - 装机失败信息五花八门，现场同学看到一串英文报错往往不知道从哪下手；归类把常见错误映射到“人话类别 + 修复建议”；
+    - `FailureClassifier.Classify(string errorMsg)` 按**顺序敏感**的关键词规则匹配（先 IP 冲突、再执行策略、权限、网卡、同名主机、DNS、网络中断、前缀非法……），
+      空串返回“未知（空错误）”、规则都没中返回“其他”；纯字符串匹配，不引任何库；
+    - 命中类别如：IP 冲突（关键词 `ip address`）、执行策略禁用（`disabled by policy`/`execution policies`）、权限不足（`access is denied`）、
+      找不到网卡（`cannot find interface`/`interfacealias`）、重名（`the name` + `already in use`）、DNS 解析失败、网络中断、前缀非法等；
+    - 控制端 `OnResultReport` 在收到失败上报时自动归类，写进 `FailCategory`/`FailSuggestion`，网格「失败归类」列悬停可见，成功上报会清空旧归类。
+67. **资产标签打印**（`Master/LabelSheetGenerator.cs`、`Master/LabelPrintForm.cs`、`Master/MasterForm.cs`）：
+    - 机房上架要把每台机器的主机名/IP/MAC/序列号贴到机箱上，手工抄容易错；用网页排版批量生成标签更准更快；
+    - 【标签打印】对话框可选范围（选中终端 / 全部在线 / 全部）、每行标签数（2/3/4），调 `LabelSheetGenerator.GenerateHtml`
+      生成 CSS Grid 布局的 A4 标签网页（字段做了 HTML 转义防注入）；
+    - 网页写临时文件后用 `Process.Start` 交给默认浏览器打开，直接 Ctrl+P 打印即可，无需依赖 Office 或第三方库；
+    - 标签内容来自网格里各终端的「主机名 / IP / MAC / 序列号」，没有序列号的终端留空（不报错）。
