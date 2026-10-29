@@ -1057,24 +1057,35 @@ namespace LanAutoConfig.Slave
                     AfterIp = actualIp
                 };
 
-                // 改 IP / 改名后本机网络可能短暂不可用：先重新解析互连地址（必要时再次临时同网段），再重试回传
+                // 改 IP / 改名后本机网络可能短暂不可用。回传原则：**先直连，真失败了才动网卡**——
+                // 以前是每次执行完都先 Resolve（内部 1.5 秒探测在网络栈刚收敛时经常误判"不通"，
+                // 导致每改一次 IP 就加一个临时同网段地址）；现在只有用现有地址回传确实失败、
+                // 且勾选了"允许临时改网卡互连"时，才去解析/添加临时地址。
                 bool reported = false;
                 bool autoReach = _chkAutoReach.Checked;   // 在 UI 线程取值，后台线程不再碰控件
                 if (!string.IsNullOrEmpty(masterIp))
                 {
-                    string mask = _template?.SubnetMask ?? "255.255.255.0";
-                    string preferIp = _lastTargetIp ?? cmd.TargetIp;   // 优先用目标 IP 当临时地址
                     reported = await Task.Run(() =>
                     {
-                        string sendIp = null;
+                        string sendIp = NetworkHelper.GetIpv4ByAdapter(ifAlias);
+                        if (!string.IsNullOrEmpty(sendIp) && ReportResultWithRetry(masterIp, sendIp, resultMsg))
+                        {
+                            resultMsg.LocalSourceIp = sendIp;   // 控制端据此刷新列表里的来源地址
+                            return true;
+                        }
+
+                        // 直连回传失败 → 才考虑临时同网段地址
                         if (autoReach)
                         {
+                            string mask = _template?.SubnetMask ?? "255.255.255.0";
+                            string preferIp = _lastTargetIp ?? cmd.TargetIp;   // 优先用目标 IP 当临时地址
                             Func<string, bool> probe = cand => TcpSend.CanConnect(masterIp, AppConfig.TcpPort, cand, 1500);
-                            sendIp = _reach.Resolve(ifAlias, _reportedMac, masterIp, mask, preferIp, probe, out string note);
+                            string punched = _reach.Resolve(ifAlias, _reportedMac, masterIp, mask, preferIp, probe, out string note);
                             if (!string.IsNullOrEmpty(note)) SafeUi(() => LogLine("互连：" + note));
+                            if (!string.IsNullOrEmpty(punched)) sendIp = punched;
                         }
                         if (string.IsNullOrEmpty(sendIp)) sendIp = NetworkHelper.GetIpv4ByAdapter(ifAlias);
-                        resultMsg.LocalSourceIp = sendIp;   // 控制端据此刷新列表里的来源地址
+                        resultMsg.LocalSourceIp = sendIp;
                         return ReportResultWithRetry(masterIp, sendIp, resultMsg);
                     });
                 }
@@ -1337,8 +1348,8 @@ namespace LanAutoConfig.Slave
             };
             var tip = new ToolTip();
             tip.SetToolTip(_chkAutoReach,
-                "勾选后：当本机与控制端不在同一网段且直连不通时，会临时在本机网卡上追加一个控制端网段的地址，" +
-                "用于完成上报/接收指令；执行配置时该地址会随网卡重配一起清除，退出程序或重置会话也会删除。\n" +
+                "勾选后：只有当本机与控制端通信确实失败（上报/回传连不上）时，才临时在本机网卡上追加一个控制端网段的地址；" +
+                "通信正常时不会修改网卡。执行配置时该地址会随网卡重配一起清除，退出程序或重置会话也会删除。\n" +
                 "改动网卡可能使本机网络短暂中断（几秒），不需要该功能时请取消勾选。");
             pnlNic.Controls.Add(_chkAutoReach);
             gbNic.Controls.Add(pnlNic);
