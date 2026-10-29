@@ -20,6 +20,27 @@ namespace LanAutoConfig.Slave
     /// </summary>
     public class LocalNetChanger
     {
+        /// <summary>
+        /// 系统是否已经在重启/关机中。为 true 时一律不再拉起新进程。
+        ///
+        /// 现场症状：下发执行命令后自动重启，屏幕上弹出「powershell.exe - 应用程序错误 0xc0000142」。
+        /// 原因是关机一开始，Windows 就会拆掉用户会话（win32k/user32 不再可用），
+        /// 这期间**任何**新建进程都会以 STATUS_DLL_INIT_FAILED(0xc0000142) 失败并弹框；
+        /// 而我们这边“关机 → 窗体关闭 → 清临时 IP → 又调一次 PowerShell”正好撞上这个时间窗。
+        /// 关机/重启一经提交就置位，后续的 RunPs/RunCmd 直接跳过，不再去踩这个坑。
+        /// </summary>
+        public static volatile bool ShutdownInProgress;
+
+        /// <summary>是否应该放弃拉起新进程（关机已提交 或 系统正在关机）。</summary>
+        public static bool SuppressLaunch
+        {
+            get
+            {
+                if (ShutdownInProgress) return true;
+                try { return Environment.HasShutdownStarted; } catch { return false; }
+            }
+        }
+
         /// <summary>设置网卡为静态 IP（含 DNS）。返回执行结果。</summary>
         public PsResult SetStaticIp(string ifAlias, string ip, string mask, string gateway, string dns1, string dns2)
         {
@@ -253,6 +274,7 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
                     try { p.Kill(true); } catch { }
                     result.Success = true;   // 关机已在进行，shutdown 挂住是正常的
                     result.Output = "shutdown 已提交（进程未在 15 秒内返回，按成功处理）";
+                    ShutdownInProgress = true;   // 关机窗口已打开：后面不要再拉起任何进程
                     return result;
                 }
 
@@ -262,6 +284,7 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
 
                 // 0 = 成功；1190 = 已有计划中的关机；1115 = 关机已在进行
                 result.Success = p.ExitCode == 0 || p.ExitCode == 1190 || p.ExitCode == 1115;
+                if (result.Success) ShutdownInProgress = true;   // 同上：进入关机倒计时，禁止再拉起新进程
                 if (!result.Success && string.IsNullOrEmpty(result.Error))
                     result.Error = $"shutdown 退出码 {p.ExitCode}";
                 return result;
@@ -280,6 +303,13 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
         private static PsResult RunPs(string script, int timeoutMs = 60000)
         {
             var result = new PsResult();
+            // 关机/重启已经开始：此时拉起 powershell.exe 必然 0xc0000142 并弹错误框，直接放弃
+            if (SuppressLaunch)
+            {
+                result.Success = false;
+                result.Error = "系统正在重启/关机，已跳过这条 PowerShell 命令";
+                return result;
+            }
             try
             {
                 // PowerShell 直接跑会在 stderr 输出 CLIXML（且中文按 ANSI 乱码）。
@@ -366,6 +396,12 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
         private PsResult RunCmd(string command, int timeoutMs = 60000)
         {
             var result = new PsResult();
+            if (SuppressLaunch)
+            {
+                result.Success = false;
+                result.Error = "系统正在重启/关机，已跳过这条命令";
+                return result;
+            }
             try
             {
                 var psi = new ProcessStartInfo("cmd.exe")

@@ -35,6 +35,11 @@ namespace LanAutoConfig.Master
         public string OuPath { get; set; }
         /// <summary>列表里被隐藏的列（列名），下次启动保持同样的显示。</summary>
         public List<string> HiddenColumns { get; set; } = new List<string>();
+        /// <summary>
+        /// 自动编号的起始号（1~253）。只记这个数，不记“开关是否打开”：
+        /// 打开状态属于本次操作意图，重启后默认关闭，避免下次启动就悄悄给新机器改号。
+        /// </summary>
+        public int AutoNumberStart { get; set; } = 1;
         public DateTime SavedAt { get; set; }
         public List<SlaveSessionItem> Items { get; set; } = new List<SlaveSessionItem>();
 

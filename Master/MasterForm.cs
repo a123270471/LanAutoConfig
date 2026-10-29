@@ -32,8 +32,6 @@ namespace LanAutoConfig.Master
         private Button _btnStart, _btnStop, _btnReset, _btnManageBlacklist, _btnWhitelist;
         /// <summary>加域 / 工作组设置入口（按钮文字会显示当前设置摘要）。</summary>
         private Button _btnDomainJoin;
-        /// <summary>一键装机入口（跑起来后按钮文字会显示当前阶段）。</summary>
-        private Button _btnProvision;
         private Label _lblSession;
         private ComboBox _cmbAdapter;
 
@@ -78,16 +76,23 @@ namespace LanAutoConfig.Master
         private string _domain, _domainUser, _domainPassword, _ouPath, _workgroup;
         /// <summary>列表里被隐藏的列名（右键表头可切换，随配置保存）。</summary>
         private readonly HashSet<string> _hiddenColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        /// <summary>
-        /// 一键装机流水线。放在主窗体而不是对话框里 —— 一轮流水线可能跑十几分钟，
-        /// 关掉对话框不能把它掐掉，否则关窗就“装到一半没人管了”。
-        /// </summary>
-        private readonly ProvisionJob _provision;
-        /// <summary>流水线驱动：每秒推进一次状态机（时间由 Tick 注入，便于单测）。</summary>
-        private readonly System.Windows.Forms.Timer _provisionTimer = new System.Windows.Forms.Timer();
-        /// <summary>流水线日志/完成事件的订阅者（装机对话框）。</summary>
-        private event Action<string> _provisionLogHandlers;
-        private event Action<ProvisionSummary> _provisionFinishedHandlers;
+        // ---- 自动编号（按上线顺序发号）----
+        /// <summary>自动编号开关：开启后，新上线的终端会自动收到下一个编号并自动上报。</summary>
+        private volatile bool _autoNumberOn;
+        /// <summary>当前要发的下一个编号（从“起始编号”开始往上加）。</summary>
+        private int _autoNumberNext = 1;
+        /// <summary>重入保护：发号过程中会改列表，列表变更事件又会回调进来。</summary>
+        private bool _autoNumberBusy;
+        /// <summary>自动编号的定时器（1 秒看一次有没有新上线的机器）。</summary>
+        private readonly System.Windows.Forms.Timer _autoNumberTimer = new System.Windows.Forms.Timer();
+        /// <summary>已下发但还没上报的编号：MAC → (编号, 次数, 下发时间)，用于“没收到就补发一次”。</summary>
+        private readonly Dictionary<string, (string Suffix, int Attempts, DateTime SentAt)> _autoNumberPending
+            = new Dictionary<string, (string, int, DateTime)>(StringComparer.OrdinalIgnoreCase);
+        /// <summary>发号失败日志的节流表（同一台 30 秒内只记一条，否则每秒刷屏）。</summary>
+        private readonly Dictionary<string, DateTime> _autoNumberFailLog
+            = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private Button _btnAutoNumber;
+        private NumericUpDown _numAutoStart;
 
         private volatile bool _broadcasting;
         private volatile bool _dispatching;
@@ -140,10 +145,9 @@ namespace LanAutoConfig.Master
             _server.TokenResolver = mac => _session.GetByMac(mac)?.AuthToken;
             _http.Log += m => SafeUi(() => LogLine(m));
 
-            // 一键装机流水线：状态机在 Common，发送动作回到这里
-            _provision = new ProvisionJob(() => SnapshotItems(), new MasterProvisionOps(this));
-            _provisionTimer.Interval = 1000;
-            _provisionTimer.Tick += (s, e) => TickProvision();
+            // 自动编号：每秒看一次有没有“在线未上报”的新机器，有就发下一个编号（关着时定时器不启动）
+            _autoNumberTimer.Interval = 1000;
+            _autoNumberTimer.Tick += (s, e) => AutoNumberTick();
 
             // 单独的心跳刷新定时器：只重画“在线”列与状态栏，不整表刷新（否则每 10 秒闪一次、还打断编辑）
             _onlineTimer.Interval = 5000;
@@ -165,8 +169,7 @@ namespace LanAutoConfig.Master
                 try { _onlineTimer.Stop(); } catch { }
                 try { _saveTimer.Stop(); } catch { }
                 try { _staggerTimer.Stop(); } catch { }
-                try { _provisionTimer.Stop(); } catch { }
-                try { _provision?.Abort("控制端退出"); } catch { }
+                try { _autoNumberTimer.Stop(); } catch { }
                 SaveSettings();   // 退出前把模板参数与终端列表记下来
                 _broadcast.Stop();
                 _server.Stop();
@@ -581,9 +584,6 @@ namespace LanAutoConfig.Master
             }
             var rec = _session.MarkResult(m);
 
-            // 直接把结果喂给流水线：不能靠“每秒去列表里读状态”——机器重启后重新上报会把状态复位成
-            // Reported，中间错过一拍就再也读不到“成功”，整轮会被误判成 0 台成功。
-            try { _provision?.NotifyExecResult(m.LocalMac, m.Success, m.ErrorMsg); } catch { }
             // 成功后清掉上一次失败留下的归类，避免“已成功却还显示旧错误类别”
             if (m.Success)
             {
@@ -772,6 +772,7 @@ namespace LanAutoConfig.Master
                 lock (_rejectLogAt) _rejectLogAt.Clear();
                 _staggerTimer.Stop();
                 _rebootQueue = null;
+                ResetAutoNumber();     // 新批次：编号从“起始号”重新开始
                 SetBroadcastUi(false);
                 _lblSession.Text = "会话已重置，重新发布模板即可开始新批次";
                 _lblBroadcast.Text = "广播: 未启动";
@@ -811,7 +812,7 @@ namespace LanAutoConfig.Master
 
         /// <summary>
         /// 真正逐台发执行指令（后台线程调用）：带令牌、带加域参数，失败退回“待执行”以便重试。
-        /// 返回成功台数。供【下发执行命令】和【一键装机】共用。
+        /// 返回成功台数。供【下发执行命令】等批量操作共用。
         /// </summary>
         internal int DispatchExecute(IReadOnlyList<SlaveSessionItem> items)
         {
@@ -985,127 +986,6 @@ namespace LanAutoConfig.Master
                 BatchRebootStaggered(dlg.BatchSize, dlg.IntervalSeconds);
         }
 
-        // ---------- 一键装机流水线 ----------
-
-        /// <summary>供装机对话框读取/设置参数与阶段。</summary>
-        internal ProvisionJob Provision => _provision;
-
-        internal void RegisterProvisionHandlers(Action<string> logHandler, Action<ProvisionSummary> doneHandler)
-        {
-            _provisionLogHandlers += logHandler;
-            _provisionFinishedHandlers += doneHandler;
-        }
-
-        internal void UnregisterProvisionHandlers(Action<string> logHandler, Action<ProvisionSummary> doneHandler)
-        {
-            _provisionLogHandlers -= logHandler;
-            _provisionFinishedHandlers -= doneHandler;
-        }
-
-        /// <summary>开始一轮装机（参数由对话框预先写入 <see cref="Provision"/> 的 Options）。</summary>
-        internal void StartProvision(IEnumerable<string> macs)
-        {
-            _provision.Start(macs, DateTime.Now);
-            _provisionTimer.Start();
-            UpdateProvisionHint();
-            ScheduleSave();
-        }
-
-        internal void AbortProvision(string why)
-        {
-            _provision.Abort(why);
-            _provisionTimer.Stop();
-            UpdateProvisionHint();
-        }
-
-        /// <summary>1 秒推进：只做状态判断，真正的下发都在后台线程，UI 不会被卡住。</summary>
-        private void TickProvision()
-        {
-            if (_provision == null) { _provisionTimer.Stop(); return; }
-            var before = _provision.Stage;
-            _provision.Tick(DateTime.Now);
-            if (_provision.Stage != before)
-            {
-                UpdateProvisionHint();
-                RefreshGrid();       // 阶段切换时整表刷新一次（状态列会变），平时不刷
-                UpdateStatusBar();
-                ScheduleSave();
-            }
-            if (!_provision.Running)
-            {
-                _provisionTimer.Stop();
-                UpdateProvisionHint();
-            }
-        }
-
-        /// <summary>把流水线当前阶段显示在【一键装机】按钮上，关掉对话框也知道跑到哪一步了。</summary>
-        private void UpdateProvisionHint()
-        {
-            if (_btnProvision == null || _btnProvision.IsDisposed) return;
-            var job = _provision;
-            if (job == null || !job.Running) { _btnProvision.Text = "一键装机…"; return; }
-            // 按钮只有 100px 宽，写全阶段名会被截断，这里给“第几步 + 短名”
-            _btnProvision.Text = job.Stage switch
-            {
-                ProvisionStage.WaitingReport => "装机①等上报",
-                ProvisionStage.Dispatching => "装机②下发中",
-                ProvisionStage.WaitingExecute => "装机③执行中",
-                ProvisionStage.Rebooting => "装机④重启中",
-                ProvisionStage.WaitingOnline => "装机⑤等上线",
-                ProvisionStage.Verifying => "装机⑥验收中",
-                ProvisionStage.WaitingVerify => "装机⑦等回传",
-                _ => "装机中…"
-            };
-        }
-
-        private void OnProvisionFinished(ProvisionSummary s)
-        {
-            _provisionTimer.Stop();
-            UpdateProvisionHint();
-            LogLine("[流水线] " + s.Describe());
-            _provisionFinishedHandlers?.Invoke(s);
-        }
-
-        /// <summary>
-        /// 把流水线要做的动作接回主窗体。
-        /// 注意：Dispatch 必须在后台线程跑 —— DispatchExecute 是同步 TCP（5 秒超时 × N 台），
-        /// 在 UI 线程上发 60 台会让窗口“未响应”十分钟。
-        /// </summary>
-        private sealed class MasterProvisionOps : IProvisionOps
-        {
-            private readonly MasterForm _f;
-            private volatile bool _busy;
-
-            public MasterProvisionOps(MasterForm f) { _f = f; }
-
-            /// <summary>下发还在进行中时，状态机不能判定“没送达”（否则会边发边重发）。</summary>
-            public bool Busy => _busy;
-
-            public void Dispatch(IReadOnlyList<SlaveSessionItem> items)
-            {
-                _busy = true;
-                Task.Run(() =>
-                {
-                    try { _f.DispatchExecute(items); }
-                    catch (Exception ex) { _f.SafeUi(() => _f.LogLine("[流水线] 下发异常：" + ex.Message)); }
-                    finally { _busy = false; }
-                });
-            }
-
-            public void Reboot(IReadOnlyList<SlaveSessionItem> items)
-                => _f.RebootItems(items, _f._provision?.Options.RebootDelaySec ?? 10);
-
-            public void Verify(IReadOnlyList<SlaveSessionItem> items) => _f.VerifyItems(items);
-
-            public void Log(string msg)
-            {
-                _f.SafeUi(() => _f.LogLine("[流水线] " + msg));
-                _f.SafeUi(() => _f._provisionLogHandlers?.Invoke(msg));
-            }
-
-            public void Finished(ProvisionSummary s) => _f.SafeUi(() => _f.OnProvisionFinished(s));
-        }
-
         /// <summary>按 MAC 批量标记/取消跳过（IP 占用扫描里“跳过冲突机”用）。</summary>
         internal void MarkSkipMacs(IEnumerable<string> macs, bool skip)
         {
@@ -1114,28 +994,6 @@ namespace LanAutoConfig.Master
             if (list.Count == 0) return;
             _session.SetSkipMany(list, skip);
             LogLine($"已{(skip ? "标记跳过" : "取消跳过")} {list.Count} 台终端（来自 IP 占用扫描）");
-            RefreshGrid();
-            UpdateStatusBar();
-            ScheduleSave();
-        }
-
-        /// <summary>一键装机流水线。</summary>
-        private void ShowProvisionDialog()
-        {
-            if (!_broadcasting)
-            {
-                MessageBox.Show("请先点【开始发布模板】。\n\n流水线要靠广播让被控端上报，再自动跑后续步骤。",
-                    "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-            if (ConflictValidator.HasConflict(_session.Items))
-            {
-                MessageBox.Show("存在目标 IP / 主机名冲突，请先修掉（或跳过其中一台）再跑流水线。",
-                    "冲突", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-            using var dlg = new ProvisionForm(this);
-            dlg.ShowDialog(this);
             RefreshGrid();
             UpdateStatusBar();
             ScheduleSave();
@@ -1422,103 +1280,188 @@ namespace LanAutoConfig.Master
         }
 
         /// <summary>
-        /// 按上线顺序给「在线未上报」的终端分配后缀编号（01、02、03…），下发后由被控端自动填写并提交上报。
+        /// 自动编号开关（工具栏上的那个按钮）。
         ///
-        /// 顺序取的是会话列表的插入顺序：每次心跳/上报发现新终端都追加到列表末尾，
-        /// 所以这个顺序就是真实的上线先后（与网格的排序/筛选无关）。
-        /// 已上报的终端占用的编号会被跳过，不会出现两台机器同号。
+        /// 打开后不再需要手工点一次“按上线顺序编号”：列表里每出现一台“在线未上报”的终端，
+        /// 就按会话顺序（= 真实上线先后）把下一个编号发过去，被控端收到后自动填号并上报，
+        /// 于是第一台上报 01、第二台 02…… 起始号可以在工具栏上预先设定。
         /// </summary>
-        private void AssignSuffixByOnlineOrder()
+        private void SetAutoNumber(bool on)
         {
-            if (!_broadcasting)
+            if (on && !_broadcasting)
             {
-                MessageBox.Show("请先点【开始发布模板】。\n\n被控端要先收到本批次的模板，才会接受编号指令并把编号换算成主机名/IP。",
+                MessageBox.Show("请先点【开始发布模板】。\n\n" +
+                                "被控端要先收到本批次的模板，才会接受编号指令并把编号换算成主机名/IP。",
                     "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
-            var picked = SelectedItems();
-            bool scoped = picked.Count > 0;
-            var pool = scoped ? picked : _session.Items.ToList();
-            var candidates = pool
-                .Where(x => x.Status == SlaveStatus.Online && string.IsNullOrWhiteSpace(x.Suffix))
-                .ToList();
-
-            if (candidates.Count == 0)
+            _autoNumberOn = on;
+            if (on)
             {
-                MessageBox.Show(scoped
-                        ? "选中的终端里没有可编号的机器。\n\n只处理“在线未上报、且还没有后缀编号”的终端。"
-                        : "当前没有可编号的终端（在线未上报）。\n\n被控端启动后会先发心跳出现在列表里，状态为“在线未上报”，\n此时才能按顺序发号。",
-                    "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
+                // 每次开启都从“起始号”重新算：现场常常是“这一批从 20 号开始”这种用法
+                _autoNumberNext = (int)_numAutoStart.Value;
+                _autoNumberPending.Clear();
+                _autoNumberFailLog.Clear();
+                _autoNumberTimer.Start();
+                LogLine($"自动编号已开启：从 {_autoNumberNext:00} 开始，按上线先后自动发号（被控端收到后自动上报）");
+                AutoNumberTick();      // 立刻处理已经在线的机器，不用等下一秒
+            }
+            else
+            {
+                _autoNumberTimer.Stop();
+                _autoNumberPending.Clear();
+                _autoNumberFailLog.Clear();
+                LogLine("自动编号已关闭");
             }
 
-            // 已被占用的编号：候选之外的终端（已上报/已编号）现有的后缀
-            var candidateSet = new HashSet<string>(candidates.Select(x => x.Mac), StringComparer.OrdinalIgnoreCase);
-            var usedSuffixes = _session.Items
-                .Where(x => !candidateSet.Contains(x.Mac))
-                .Select(x => x.Suffix)
-                .ToList();
+            UpdateAutoNumberHint();
+            ScheduleSave();
+        }
 
-            // 先预演一遍，把要发的号算出来给操作员确认（避免点下去就改了一堆机器的名字）
-            var suffixes = SuffixPlanner.Plan(usedSuffixes, candidates.Count);
-            var plan = new List<KeyValuePair<SlaveSessionItem, string>>();
-            for (int i = 0; i < suffixes.Count; i++)
-                plan.Add(new KeyValuePair<SlaveSessionItem, string>(candidates[i], suffixes[i]));
-            if (plan.Count == 0)
+        /// <summary>起始号被改动：没跑起来就实时生效；正在跑只提示“下次开启生效”，避免编号突然跳号。</summary>
+        private void OnAutoStartChanged()
+        {
+            if (_autoNumberOn)
             {
-                MessageBox.Show("编号已用尽（后缀对应的 IP 末段最大 254）。请先重置会话，或手工调整部分终端的编号。",
-                    "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
+                LogLine($"起始号已改为 {(int)_numAutoStart.Value:00}（本次已在发号中，从下次开启生效）");
             }
-
-            var preview = new StringBuilder();
-            foreach (var kv in plan.Take(10))
+            else
             {
-                string tgt = string.IsNullOrEmpty(kv.Key.SourceIp) ? kv.Key.TargetIp : kv.Key.SourceIp;
-                preview.AppendLine($"  {kv.Value}  →  {kv.Key.Mac}  ({tgt})");
+                _autoNumberNext = (int)_numAutoStart.Value;
             }
-            if (plan.Count > 10) preview.AppendLine($"  … 共 {plan.Count} 台");
+            ScheduleSave();
+        }
 
-            string scopeText = scoped ? $"选中的 {candidates.Count} 台" : $"全部 {candidates.Count} 台在线未上报终端";
-            string tail = candidates.Count > plan.Count
-                ? $"\n注意：可用编号不足，只处理前 {plan.Count} 台。"
-                : "";
-            if (MessageBox.Show($"按上线顺序对{scopeText}下发编号：\n\n{preview}{tail}\n" +
-                                "被控端收到后会自己填好编号并立即提交上报（主机名 = 前缀 + 编号，IP 末段 = 编号 + 1）。\n" +
-                                "上线早的在前（列表从上到下就是这个顺序）。确定下发？",
-                    "按上线顺序编号", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
-                return;
-
-            string sid = _session.SessionId;
-            string bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
-            int ok = 0, fail = 0;
-            foreach (var kv in plan)
+        private void UpdateAutoNumberHint()
+        {
+            if (_btnAutoNumber == null || _btnAutoNumber.IsDisposed) return;
+            if (_autoNumberOn)
             {
-                var it = kv.Key;
-                string suffix = kv.Value;
-                var cmd = new MasterAssignSuffixCmdMsg(sid, it.Mac, suffix);
-                if (SendToItem(it, cmd, out string err))
+                _btnAutoNumber.Text = $"自动编号：开（下一个 {_autoNumberNext:00}）";
+                _btnAutoNumber.Width = 170;
+            }
+            else
+            {
+                _btnAutoNumber.Text = "自动编号：关";
+                _btnAutoNumber.Width = 118;
+            }
+        }
+
+        /// <summary>会话重置 / 换批次：编号从起始号重新开始。</summary>
+        private void ResetAutoNumber()
+        {
+            _autoNumberPending.Clear();
+            _autoNumberFailLog.Clear();
+            _autoNumberNext = (int)(_numAutoStart?.Value ?? 1);
+            UpdateAutoNumberHint();
+        }
+
+        /// <summary>
+        /// 每秒跑一次：给“在线未上报”的终端发号，并补发上一次可能丢了的指令。
+        ///
+        /// 顺序取的是会话列表的顺序 —— 每次心跳/上报发现新终端都追加到列表末尾，
+        /// 所以这个顺序就是真实的上线先后（与网格的排序/筛选无关）。
+        /// </summary>
+        private void AutoNumberTick()
+        {
+            if (!_autoNumberOn || !_broadcasting || _autoNumberBusy) return;
+            if (!IsHandleCreated || IsDisposed) return;
+
+            _autoNumberBusy = true;
+            try
+            {
+                var now = DateTime.Now;
+
+                // 1) 补发：下发成功但一直没上报（指令被丢/被防火墙吞掉），15 秒后重发，最多 3 次
+                foreach (var kv in _autoNumberPending.ToList())
                 {
-                    ok++;
-                    it.Suffix = suffix;      // 先记下来让界面有反馈；被控端上报回来后以它为准
-                    LogLine($"[编号] {it.Mac}（{it.SourceIp ?? it.TargetIp}）← {suffix}");
+                    var it = _session.GetByMac(kv.Key);
+                    if (it == null || it.Status != SlaveStatus.Online)
+                    {
+                        _autoNumberPending.Remove(kv.Key);      // 已经上报了（或终端没了），不再管
+                        continue;
+                    }
+                    if ((now - kv.Value.SentAt).TotalSeconds < 15) continue;
+                    if (kv.Value.Attempts >= 3)
+                    {
+                        _autoNumberPending.Remove(kv.Key);
+                        LogLine($"[自动编号] {it.Mac} 连发 3 次都没有上报，跳过（请看它是否在线、防火墙是否放行 TCP {AppConfig.TcpPort}）");
+                        continue;
+                    }
+                    var again = new MasterAssignSuffixCmdMsg(_session.SessionId, it.Mac, kv.Value.Suffix);
+                    bool ok = SendToItem(it, again, out string err2);
+                    if (ok) _autoNumberPending[kv.Key] = (kv.Value.Suffix, kv.Value.Attempts + 1, now);
+                    else
+                    {
+                        if (err2 != null && err2.Contains("令牌")) continue;   // 还没拿到令牌，等它心跳
+                        LogLine($"[自动编号] 补发 {kv.Value.Suffix} 到 {it.Mac} 失败：{err2}");
+                    }
                 }
-                else
-                {
-                    fail++;
-                    LogLine($"[编号] {it.Mac}（{it.SourceIp ?? it.TargetIp}）下发失败：{err}");
-                }
-            }
 
-            RefreshGrid();
-            UpdateStatusBar();
-            ScheduleSave();      // 编号先落盘：控制端意外关掉再开，分配结果还在
-            LogLine($"按上线顺序编号：成功下发 {ok} 台，失败 {fail} 台");
-            MessageBox.Show($"已下发编号：成功 {ok} 台，失败 {fail} 台（详见日志）。\n\n" +
-                            "被控端会自动填好编号并提交上报，列表里状态会变成“已上报待审核”。\n" +
-                            "若某台一直停在“在线未上报”，说明它没收到指令（离线/会话不一致），可再点一次。",
-                "按上线顺序编号", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                // 2) 发新号
+                var used = new HashSet<int>();
+                foreach (var x in _session.Items)
+                    if (int.TryParse((x.Suffix ?? "").Trim(), out int n2) && n2 > 0) used.Add(n2);
+
+                var candidates = _session.Items
+                    .Where(x => x.Online                       // 只给“此刻真的在线”的机器发号，关机中的机器不去打扰
+                                && x.Status == SlaveStatus.Online
+                                && string.IsNullOrWhiteSpace(x.Suffix)
+                                && !_autoNumberPending.ContainsKey(x.Mac))
+                    .ToList();
+                if (candidates.Count == 0) { UpdateAutoNumberHint(); return; }
+
+                bool ranOut = false;
+                foreach (var it in candidates)
+                {
+                    while (_autoNumberNext <= SuffixPlanner.MaxSuffix && used.Contains(_autoNumberNext)) _autoNumberNext++;
+                    if (_autoNumberNext > SuffixPlanner.MaxSuffix) { ranOut = true; break; }
+
+                    string suffix = _autoNumberNext.ToString("00");
+                    var cmd = new MasterAssignSuffixCmdMsg(_session.SessionId, it.Mac, suffix);
+                    string where = it.SourceIp ?? it.TargetIp ?? "-";
+                    if (SendToItem(it, cmd, out string err))
+                    {
+                        used.Add(_autoNumberNext);
+                        it.Suffix = suffix;    // 先把界面点亮；以它上报回来的为准
+                        _autoNumberPending[it.Mac] = (suffix, 1, now);
+                        LogLine($"[自动编号] {it.Mac}（{where}）← {suffix}，已通知它自动上报");
+                        _autoNumberNext++;
+                    }
+                    else
+                    {
+                        // 每秒重试一次，日志要节流，否则一台离线机器就能把日志刷满
+                        if (!_autoNumberFailLog.TryGetValue(it.Mac, out DateTime lastLog) ||
+                            (now - lastLog).TotalSeconds >= 30)
+                        {
+                            _autoNumberFailLog[it.Mac] = now;
+                            LogLine($"[自动编号] {it.Mac}（{where}）下发 {suffix} 失败：{err}（会继续重试）");
+                        }
+                    }
+                }
+
+                if (ranOut)
+                {
+                    LogLine($"[自动编号] 编号已用尽（上限 {SuffixPlanner.MaxSuffix}，对应 IP 末段 {SuffixPlanner.MaxSuffix + 1}），" +
+                            "剩下的终端不再发号；请调整起始号或改用其他网段");
+                    _autoNumberOn = false;
+                    _autoNumberTimer.Stop();
+                }
+
+                UpdateAutoNumberHint();
+                RefreshGrid();
+                UpdateStatusBar();
+                ScheduleSave();
+            }
+            catch (Exception ex)
+            {
+                LogLine("[自动编号] 异常：" + ex.Message);
+            }
+            finally
+            {
+                _autoNumberBusy = false;
+            }
         }
 
         /// <summary>
@@ -2301,9 +2244,26 @@ namespace LanAutoConfig.Master
             var btnRefresh = new Button { Text = "刷新列表", Width = 90, Height = 32 };
             btnRefresh.Click += (s, e) => RefreshTerminalList();
 
-            // ---- 第二行：按上线顺序编号 + 电源类 + 自启 ----
-            var btnAssignSeq = new Button { Text = "按上线顺序编号", Width = 130, Height = 32 };
-            btnAssignSeq.Click += (s, e) => AssignSuffixByOnlineOrder();
+            // ---- 第二行：自动编号（开关）+ 电源类 + 自启 ----
+            // 这里是“开关”而不是一次性按钮：打开后，每有一台新机器上线（在线未上报），
+            // 就自动把下一个编号发给它，被控端收到后自己填号并自动上报（01、02、03…）。
+            _btnAutoNumber = new Button { Text = "自动编号：关", Width = 118, Height = 32 };
+            _btnAutoNumber.Click += (s, e) => SetAutoNumber(!_autoNumberOn);
+            var lblAutoStart = new Label
+            {
+                Text = "起始号：",
+                AutoSize = true,
+                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
+                Margin = new Padding(6, 9, 0, 0)
+            };
+            _numAutoStart = new NumericUpDown
+            {
+                Minimum = 1, Maximum = SuffixPlanner.MaxSuffix, Value = 1,
+                Width = 60, Height = 30,
+                Margin = new Padding(0, 4, 8, 0),
+                TextAlign = HorizontalAlignment.Center
+            };
+            _numAutoStart.ValueChanged += (s, e) => OnAutoStartChanged();
             var btnReboot = new Button { Text = "批量重启", Width = 90, Height = 32 };
             btnReboot.Click += (s, e) => BatchRebootSelected();
             var btnShutdown = new Button { Text = "批量关机", Width = 90, Height = 32 };
@@ -2316,7 +2276,10 @@ namespace LanAutoConfig.Master
             btnAutostartOff.Click += (s, e) => BatchSetAutostartSelected(false);
 
             var tipBar = new ToolTip();
-            tipBar.SetToolTip(btnAssignSeq, "对“在线未上报”的终端按上线顺序分配 01、02、03… 并让它们自动上报（可先选中部分终端只处理选中的）");
+            tipBar.SetToolTip(_btnAutoNumber,
+                "打开后按“上线先后”自动发号：第一台在线未上报的机器拿 01，第二台 02…\n" +
+                "被控端收到编号后自动填好并提交上报；起始号用右边的小框预先设定。");
+            tipBar.SetToolTip(_numAutoStart, "自动编号的起始号（1~253，对应 IP 末段 2~254）");
             tipBar.SetToolTip(btnReboot, "被控端执行 shutdown /r /t 10（10 秒后重启）");
             tipBar.SetToolTip(btnShutdown, "被控端执行 shutdown /s /t 10（10 秒后关机，之后该终端离线）");
             tipBar.SetToolTip(btnWol, "向关机中的终端发送 WOL 魔术包（需同一广播域且 BIOS/网卡开启网络唤醒）");
@@ -2328,7 +2291,9 @@ namespace LanAutoConfig.Master
             bar2.Controls.Add(btnSelectAll);
             bar2.Controls.Add(btnRefresh);
             bar2.SetFlowBreak(btnRefresh, true);      // 显式分成两行，不靠容器宽度“碰运气”
-            bar2.Controls.Add(btnAssignSeq);
+            bar2.Controls.Add(_btnAutoNumber);
+            bar2.Controls.Add(lblAutoStart);
+            bar2.Controls.Add(_numAutoStart);
             bar2.Controls.Add(btnReboot);
             bar2.Controls.Add(btnShutdown);
             bar2.Controls.Add(btnWol);
@@ -2349,12 +2314,8 @@ namespace LanAutoConfig.Master
             bar2.Controls.Add(btnStagger);
             bar2.Controls.Add(btnVerify);
 
-            // ---- 第四行：一键装机 / 文件分发 / 远程截图 / 程序控制 / 网络扫描 ----
+            // ---- 第四行：文件分发 / 远程截图 / 程序控制 / 网络扫描 ----
             bar2.SetFlowBreak(btnVerify, true);
-            var btnProvision = new Button { Text = "一键装机…", Width = 100, Height = 32 };
-            btnProvision.Click += (s, e) => ShowProvisionDialog();
-            MakePrimary(btnProvision);
-            _btnProvision = btnProvision;
             var btnFilePush = new Button { Text = "文件分发", Width = 100, Height = 32 };
             btnFilePush.Click += (s, e) => ShowFilePushDialog();
             var btnShot = new Button { Text = "远程截图", Width = 100, Height = 32 };
@@ -2374,13 +2335,11 @@ namespace LanAutoConfig.Master
             var btnProbe = new Button { Text = "连通性检测", Width = 110, Height = 32 };
             btnProbe.Click += (s, e) => ShowConnectivityDialog();
 
-            tipBar.SetToolTip(btnProvision, "一条流水线跑完：等上报 → 自动下发 → 失败自动重试 → 自动重启 → 等上线 → 自动验收 → 出汇总");
             tipBar.SetToolTip(btnFilePush, "把安装包/脚本推到被控端并静默执行（内置文件服务，带 SHA256 校验）");
             tipBar.SetToolTip(btnShot, "让被控端截一张当前桌面回传，看它卡在哪个界面");
             tipBar.SetToolTip(btnProc, "只重启被控端程序（不重启电脑），程序卡死时用");
             tipBar.SetToolTip(btnIpScan, "扫描目标 IP 在网段里是否已被别的机器占用（读 ARP 表，能发现模板冲突之外的“老机器占地址”）");
             tipBar.SetToolTip(btnProbe, "同时探 ping 和 48889 端口：分清是掉线、还是机器在但被控端没跑/被防火墙拦");
-            bar2.Controls.Add(btnProvision);
             bar2.Controls.Add(btnFilePush);
             bar2.Controls.Add(btnShot);
             bar2.Controls.Add(btnProc);
@@ -2588,6 +2547,7 @@ namespace LanAutoConfig.Master
                     DomainPassword = _domainPassword,
                     OuPath = _ouPath,
                     HiddenColumns = _hiddenColumns.ToList(),
+                    AutoNumberStart = (int)(_numAutoStart?.Value ?? 1),
                     Items = _session.Items.ToList()
                 };
                 if (!s.Save(_settingsPath))
@@ -2628,6 +2588,14 @@ namespace LanAutoConfig.Master
                 _hiddenColumns.Clear();
                 foreach (string c in s.HiddenColumns) if (!string.IsNullOrWhiteSpace(c)) _hiddenColumns.Add(c);
                 ApplyColumnVisibility();
+
+                // 自动编号：只恢复起始号，开关本身每次都从“关”开始（见 MasterSettings.AutoNumberStart 注释）
+                if (s.AutoNumberStart >= 1 && s.AutoNumberStart <= SuffixPlanner.MaxSuffix)
+                {
+                    _numAutoStart.Value = s.AutoNumberStart;
+                    _autoNumberNext = s.AutoNumberStart;
+                }
+                UpdateAutoNumberHint();
 
                 if (!string.IsNullOrEmpty(s.AdapterAlias))
                 {

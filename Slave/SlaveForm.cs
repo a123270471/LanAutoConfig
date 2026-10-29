@@ -25,6 +25,12 @@ namespace LanAutoConfig.Slave
         /// <summary>本次上报的目标 IP（选临时地址时避开它）。</summary>
         private string _lastTargetIp;
         private bool _executing;
+        /// <summary>
+        /// 系统正在关机/重启（收到 WM_QUERYENDSESSION）。
+        /// 这时窗体也会被关闭，但**不能**再去做“清临时 IP”这类要拉起 PowerShell 的收尾动作：
+        /// 关机期间新建进程必然 0xc0000142 并弹一个“powershell.exe 应用程序错误”的框。
+        /// </summary>
+        private volatile bool _osShuttingDown;
 
         // UI
         private Label _lblStatus, _lblTmplIp, _lblTmplMask, _lblTmplGw, _lblTmplDns, _lblTmplHn, _lblTmplDhcp, _lblSession;
@@ -103,11 +109,41 @@ namespace LanAutoConfig.Slave
             InitAutostart();   // 开机自启：界面勾选状态与注册表实际内容对齐（默认开启）
             FormClosing += (s, e) =>
             {
-                try { _reach.Cleanup(); } catch { }   // 退出时把临时同网段地址删掉
+                // 关机/重启引起的关闭：不要清临时 IP（那要拉起 PowerShell，关机窗口里必失败并弹错误框）。
+                // 地址是临时的，下次开机由 DHCP/模板配置重新决定，留着也不会影响什么。
+                if (!_osShuttingDown && !LocalNetChanger.ShutdownInProgress)
+                {
+                    try { _reach.Cleanup(); } catch { }
+                }
+                else
+                {
+                    try { LogLine("系统正在关机/重启，跳过临时地址清理（避免拉起 PowerShell 弹出 0xc0000142）"); } catch { }
+                }
                 try { _hb.Stop(); } catch { }
                 _udp.Stop();
                 _tcp.Stop();
             };
+        }
+
+        /// <summary>
+        /// 捕获关机/注销通知：Windows 在开始关机前会先发 WM_QUERYENDSESSION 给所有顶层窗口，
+        /// 这里记下“系统要关机了”，FormClosing 与 PowerShell 执行器据此不再拉起新进程。
+        /// </summary>
+        protected override void WndProc(ref Message m)
+        {
+            const int WM_QUERYENDSESSION = 0x0011;
+            const int WM_ENDSESSION = 0x0016;
+            if (m.Msg == WM_QUERYENDSESSION || m.Msg == WM_ENDSESSION)
+            {
+                _osShuttingDown = true;
+                LocalNetChanger.ShutdownInProgress = true;
+                if (m.Msg == WM_QUERYENDSESSION)
+                {
+                    // 这时候窗体随时会被销毁，写日志只是“留个线索”，任何异常都不能往外抛
+                    try { SafeUi(() => LogLine("系统正在关机/重启，停止一切新进程调用")); } catch { }
+                }
+            }
+            base.WndProc(ref m);
         }
 
         private static string ShortId(string sid)
@@ -379,6 +415,12 @@ namespace LanAutoConfig.Slave
         {
             if (!IsForThisMachine(cmd.LocalMac, "自定义命令"))
                 return;
+            if (LocalNetChanger.ShutdownInProgress)
+            {
+                // 已经进入关机倒计时：再执行只会拉起 PowerShell 然后 0xc0000142 弹框，而且结果也回不去了
+                LogLine("[忽略] 系统正在重启/关机，不再执行新的自定义命令");
+                return;
+            }
             if (_template == null || string.IsNullOrEmpty(_masterIp))
             {
                 LogLine("[拒绝] 自定义命令：尚未收到模板/控制端地址，忽略");
@@ -939,6 +981,12 @@ namespace LanAutoConfig.Slave
 
         private async Task ExecuteAsync(MasterExecuteCmdMsg cmd)
         {
+            if (LocalNetChanger.ShutdownInProgress)
+            {
+                // 已经进入关机倒计时：不要再动网卡/改机器名（那要拉起 PowerShell，必崩并弹框）
+                LogLine("[忽略] 系统正在重启/关机，不再执行新的下发指令");
+                return;
+            }
             if (_executing) return;
             _executing = true;
 
