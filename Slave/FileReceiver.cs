@@ -21,6 +21,9 @@ namespace LanAutoConfig.Slave
     /// </summary>
     public static class FileReceiver
     {
+        /// <summary>stdout / stderr 单路最多保留的字节数。超出部分丢弃，避免一条大输出命令把内存吃光。</summary>
+        private const int MaxCaptureBytes = 256 * 1024;
+
         private static readonly Lazy<HttpClient> _http = new Lazy<HttpClient>(() =>
             new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
             {
@@ -179,14 +182,19 @@ namespace LanAutoConfig.Slave
                 using var p = Process.Start(psi);
                 if (p == null) { r.Message = "无法启动进程：" + exe; return r; }
 
-                using var outBuf = new MemoryStream();
-                using var errBuf = new MemoryStream();
-                Task oc = p.StandardOutput.BaseStream.CopyToAsync(outBuf);
-                Task ec = p.StandardError.BaseStream.CopyToAsync(errBuf);
+                // 不设上限时这里是个隐患：有人下发 `dir /s C:\`、`systeminfo` 之类的命令，
+                // 输出会被整套读进内存，几十台机器同时跑就能把被控端吃光内存。
+                // 超过上限的部分继续"读走但丢弃"——不能只是不读，否则管道塞满，子进程会卡在写 stdout 上永不退出。
+                var outBuf = new MemoryStream();
+                var errBuf = new MemoryStream();
+                Task oc = PumpAsync(p.StandardOutput.BaseStream, outBuf, MaxCaptureBytes);
+                Task ec = PumpAsync(p.StandardError.BaseStream, errBuf, MaxCaptureBytes);
 
                 if (!p.WaitForExit(timeoutMs))
                 {
                     try { p.Kill(true); } catch { }
+                    // 进程被杀后管道关闭，泵会自然结束。等一小会儿再走，避免它继续往即将被回收的流里写。
+                    try { Task.WaitAll(new[] { oc, ec }, 2000); } catch { }
                     r.Message = $"执行超时（{timeoutMs / 1000} 秒），已强制结束";
                     return r;
                 }
@@ -196,6 +204,11 @@ namespace LanAutoConfig.Slave
                 r.Executed = true;
                 string stdout = ConsoleText.Decode(outBuf.ToArray()).Trim();
                 string stderr = ConsoleText.Decode(errBuf.ToArray()).Trim();
+                if (outBuf.Length >= MaxCaptureBytes || errBuf.Length >= MaxCaptureBytes)
+                {
+                    stdout = TruncateNote(stdout);
+                    stderr = TruncateNote(stderr);
+                }
                 bool ok = p.ExitCode == 0 || p.ExitCode == 3010 || p.ExitCode == 1641;
                 r.Success = ok;
                 r.Message = ok
@@ -212,6 +225,31 @@ namespace LanAutoConfig.Slave
                 return r;
             }
         }
+
+        /// <summary>
+        /// 把子进程的一路输出搬进内存，最多保留 <paramref name="cap"/> 字节；
+        /// 超出后仍然继续 Read（丢弃内容），这样管道不会塞满、子进程不会卡在写 stdout 上。
+        /// </summary>
+        private static async Task PumpAsync(Stream src, MemoryStream dst, int cap)
+        {
+            var buf = new byte[8192];
+            try
+            {
+                int n;
+                while ((n = await src.ReadAsync(buf, 0, buf.Length).ConfigureAwait(false)) > 0)
+                {
+                    long room = cap - dst.Length;
+                    if (room > 0) dst.Write(buf, 0, (int)Math.Min(n, room));
+                }
+            }
+            catch
+            {
+                // 进程被 Kill 或管道被关闭，都是正常路径
+            }
+        }
+
+        private static string TruncateNote(string s)
+            => (string.IsNullOrEmpty(s) ? "" : s + "\n") + $"[输出超过 {MaxCaptureBytes / 1024} KB，已截断]";
 
         private static string GuessMode(string path)
         {

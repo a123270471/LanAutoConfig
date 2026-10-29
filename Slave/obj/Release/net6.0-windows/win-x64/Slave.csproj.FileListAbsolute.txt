@@ -10,10 +10,10 @@ D:\ip\LanAutoConfig\Slave\obj\Release\net6.0-windows\win-x64\Slave.GeneratedMSBu
 D:\ip\LanAutoConfig\Slave\obj\Release\net6.0-windows\win-x64\Slave.AssemblyInfoInputs.cache
 D:\ip\LanAutoConfig\Slave\obj\Release\net6.0-windows\win-x64\Slave.AssemblyInfo.cs
 D:\ip\LanAutoConfig\Slave\obj\Release\net6.0-windows\win-x64\Slave.csproj.CoreCompileInputs.cache
-D:\ip\LanAutoConfig\Slave\obj\Release\net6.0-windows\win-x64\Slave.csproj.CopyComplete
 D:\ip\LanAutoConfig\Slave\obj\Release\net6.0-windows\win-x64\LanAutoConfigSlave.dll
 D:\ip\LanAutoConfig\Slave\obj\Release\net6.0-windows\win-x64\refint\LanAutoConfigSlave.dll
 D:\ip\LanAutoConfig\Slave\obj\Release\net6.0-windows\win-x64\LanAutoConfigSlave.pdb
 D:\ip\LanAutoConfig\Slave\obj\Release\net6.0-windows\win-x64\Slave.genruntimeconfig.cache
 D:\ip\LanAutoConfig\Slave\obj\Release\net6.0-windows\win-x64\ref\LanAutoConfigSlave.dll
 D:\ip\LanAutoConfig\Slave\bin\Release\net6.0-windows\win-x64\System.Management.dll
+D:\ip\LanAutoConfig\Slave\obj\Release\net6.0-windows\win-x64\Slave.csproj.CopyComplete

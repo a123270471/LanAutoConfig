@@ -166,9 +166,14 @@ namespace LanAutoConfig.Master
             if (string.IsNullOrWhiteSpace(name)) return null;
             string bare = Path.GetFileName(name);                 // 去掉任何目录成分
             if (!string.Equals(bare, name, StringComparison.Ordinal)) return null;
+            if (bare == "." || bare == "..") return null;         // GetFileName 不会过滤这两个
             if (bare.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return null;
             string full = Path.GetFullPath(Path.Combine(_rootDir, bare));
-            if (!full.StartsWith(_rootDir, StringComparison.OrdinalIgnoreCase)) return null;
+            // 比较时必须带上目录分隔符：直接 StartsWith(_rootDir) 会让 "C:\share" 误判
+            // "C:\share-other\x.txt" 也在分发目录里。
+            string rootWithSep = _rootDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                                 + Path.DirectorySeparatorChar;
+            if (!full.StartsWith(rootWithSep, StringComparison.OrdinalIgnoreCase)) return null;
             return full;
         }
 

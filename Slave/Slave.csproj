@@ -13,13 +13,15 @@
     <Product>局域网配置工具（被控端）</Product>
     <AssemblyTitle>局域网配置工具-被控端</AssemblyTitle>
     <Description>局域网 PC 批量更名 &amp; IP 配置工具（被控端）</Description>
-    <!-- 单文件独立 exe，内置 .NET6 运行时 -->
+    <!-- 框架依赖：单文件 exe，但不内置 .NET 运行时（目标机需先装 .NET 6 桌面运行时 x64）。
+         exe 名保持正式名，不加任何后缀。 -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <SelfContained>true</SelfContained>
+    <SelfContained>false</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <PublishTrimmed>false</PublishTrimmed>
-    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <!-- 框架依赖发布里没有运行时可供压缩，开着只会拖慢启动 -->
+    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
     <!-- 关闭 apphost 的 CET 兼容标记：.NET 9+ SDK 默认会打上该标记，
          而没打 CET 补丁的 Windows 上一启动就 "Unknown Hard Error"（.NET 6 SDK 会忽略此项，无副作用）。 -->
     <CETCompat>false</CETCompat>
@@ -27,7 +29,6 @@
     <ApplicationIcon>..\app.ico</ApplicationIcon>
     <!-- 中文程序名：发布后把 exe 改名（程序集名保持 ASCII，避免工具链兼容问题） -->
     <PublishedExeName>局域网配置工具-被控端</PublishedExeName>
-    <PublishedExeName Condition="'$(SlimBuild)' == 'true'">局域网配置工具-被控端-精简版</PublishedExeName>
     <!-- 只保留英文资源，省掉其它语言的卫星程序集（约 -5MB） -->
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>

@@ -186,7 +186,7 @@ namespace LanAutoConfig.Slave
             _txtSuffix.Enabled = true;
             _btnSubmit.Enabled = true;
             _txtSuffix.Text = "";
-            _lblStatus.Text = "已收到模板，请输入后缀编号并上报";
+            _lblStatus.Text = "已收到模板，请输入后缀编号并上报（输完按回车即可）";
             LogLine($"收到模板：控制端={masterIp} 主机名前缀={t.HostNamePrefix} IP前缀={(t.IsDhcp ? "DHCP" : t.IpPrefix)}");
 
             // 有了控制端地址就能发心跳了（在线状态/进度看板用）
@@ -792,6 +792,26 @@ namespace LanAutoConfig.Slave
             RefreshPreview();
         }
 
+        /// <summary>
+        /// 后缀框里按回车 = 点【提交上报】。现场装机时一只手在键盘上敲编号，
+        /// 直接回车就走，不用再把鼠标移到按钮上。
+        /// </summary>
+        private void _txtSuffix_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Enter) return;
+
+            // 吞掉回车：一是避免系统提示音，二是避免这个回车再被窗体的默认按钮
+            // 处理一次（将来若给窗体设了 AcceptButton，会导致重复上报）。
+            e.SuppressKeyPress = true;
+            e.Handled = true;
+
+            if (!_btnSubmit.Enabled) return;                       // 还没收到模板/正在忙
+            if (string.IsNullOrWhiteSpace(_txtSuffix.Text)) return; // 空编号不弹校验框，静默忽略
+
+            // 走 PerformClick 而不是直接调 _btnSubmit_Click，复用同一套校验与上报流程
+            _btnSubmit.PerformClick();
+        }
+
         private void RefreshPreview()
         {
             if (_template == null || string.IsNullOrWhiteSpace(_txtSuffix.Text))
@@ -1360,6 +1380,7 @@ namespace LanAutoConfig.Slave
             pnlSuffix.Controls.Add(new Label { Text = "后缀编号：", AutoSize = true, Margin = new Padding(0, 6, 4, 0) });
             _txtSuffix = new TextBox { Width = 110, Enabled = false };
             _txtSuffix.TextChanged += _txtSuffix_TextChanged;
+            _txtSuffix.KeyDown += _txtSuffix_KeyDown;       // 回车 = 提交上报
             pnlSuffix.Controls.Add(_txtSuffix);
             _btnSubmit = new Button { Text = "提交上报", Width = 100, Height = 30, Enabled = false, Margin = new Padding(10, 0, 0, 0) };
             _btnSubmit.Click += _btnSubmit_Click;

@@ -44,17 +44,27 @@ namespace LanAutoConfig.Slave
             {
                 UdpReceiveResult res;
                 try { res = await _udp.ReceiveAsync(); }
-                catch { break; }
+                catch (Exception ex)
+                {
+                    // 原来是一句空 catch + break：任何一次非停止类的接收异常（网卡被禁用后重新启用、
+                    // 驱动瞬时错误）都会让这个循环永久退出，而界面上“已监听 UDP”的日志还在，
+                    // 现场表现就是“控制端一直在广播，这台机器却再也收不到模板”。改成重试 + 记日志。
+                    if (ct.IsCancellationRequested) break;
+                    Log?.Invoke($"[UDP 监听] 接收出错，稍后重试：{ex.Message}");
+                    try { await Task.Delay(500, ct); } catch { break; }
+                    continue;
+                }
                 string masterIp = res.RemoteEndPoint.Address.ToString();
                 string json;
                 try { json = Encoding.UTF8.GetString(res.Buffer); }
                 catch { continue; }
 
                 var msg = JsonHelper.Deserialize(json);
-                if (msg is BroadcastTemplateMsg t && t.Validate())
-                {
-                    OnTemplate?.Invoke(TemplateModel.From(t), masterIp, t.SessionId);
-                }
+                if (!(msg is BroadcastTemplateMsg t) || !t.Validate()) continue;
+
+                // 订阅者（窗体）里的异常不能让接收循环挂掉：它一死，UDP 就再也收不到模板了。
+                try { OnTemplate?.Invoke(TemplateModel.From(t), masterIp, t.SessionId); }
+                catch (Exception ex) { Log?.Invoke($"[UDP 监听] 处理模板时出错（已忽略该条）：{ex.Message}"); }
             }
         }
 

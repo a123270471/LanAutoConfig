@@ -3,10 +3,9 @@
 控制端 / 被控端拆分为 **两个独立程序**，面向机房批量装机、工位批量部署 Windows 终端。
 
 - **技术栈**：C# / .NET 6 WinForms，SQLite（控制端日志），UDP 广播发现 + TCP 可靠传输，本地 PowerShell 修改网卡与计算机名
-- **产物**：两个单文件独立 exe（内置 .NET 6 运行时 + SQLite，无需目标机安装运行时），Windows 10/11 / Server2016+
+- **产物**：两个单文件 exe（内置 SQLite；**不内置 .NET 运行时**，目标机需先装 .NET 6 桌面运行时 x64），Windows 10/11 / Server2016+
   - 控制端：`bin\master\局域网配置工具-控制端.exe`
   - 被控端：`bin\slave\局域网配置工具-被控端.exe`
-  - 精简版（体积小，需目标机装 .NET 6 桌面运行时）：`bin\master-slim\局域网配置工具-控制端-精简版.exe`、`bin\slave-slim\局域网配置工具-被控端-精简版.exe`
 - **通信**：UDP 48888（广播发现 + 模板推送），TCP 48889（上报 / 执行指令 / 结果回传）；UTF-8 JSON，MsgType + SessionId 会话隔离 + Magic/Check 校验
 - **共享**：协议消息类、网络工具、校验器、AppConfig（端口/目录）、TcpSend 集中在 `Common` 类库，两端引用同一份实现，保证互通
 
@@ -25,6 +24,7 @@
 3. 被控端输入后缀编号，自动拼接预览完整主机名与 IP
    - **拼接规则：主机名 = 前缀 + 后缀原文；IP 末段 = 后缀编号 + 1**（后缀 `1` → `.2`，把 `.1` 留给网关；后缀 `002` → 主机名 `PC-ROOM01-002`、IP `.3`）
    - 末段为 0（网段地址）/ 255（广播地址）、等于网关、或后缀含非数字时直接拒绝并在界面上提示原因
+   - **输完编号按回车就等于点【提交上报】**，现场装机不用把鼠标挪到按钮上
 4. 被控端【提交上报】，TCP 上报本机 MAC / 当前 IP / 目标配置
 5. 控制端加入终端列表，自动做 IP、主机名冲突检测（冲突标红，禁止下发）
 6. 管理员可手动修改单台目标主机名 / IP、删除终端、标记跳过
@@ -54,45 +54,44 @@ D:\ip\build.cmd
 
 ```bash
 dotnet build LanAutoConfig.sln -c Release
-dotnet publish Master/Master.csproj -c Release -r win-x64 --self-contained true -o bin\master
-dotnet publish Slave/Slave.csproj -c Release -r win-x64 --self-contained true -o bin\slave
-# 精简版（框架依赖，体积小，需目标机装 .NET 6 桌面运行时）
-dotnet publish Master/Master.csproj -c Release -r win-x64 --self-contained false -p:SlimBuild=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=false -o bin\master-slim
-dotnet publish Slave/Slave.csproj -c Release -r win-x64 --self-contained false -p:SlimBuild=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=false -o bin\slave-slim
+dotnet publish Master/Master.csproj -c Release -r win-x64 --self-contained false -o bin\master
+dotnet publish Slave/Slave.csproj -c Release -r win-x64 --self-contained false -o bin\slave
 ```
 
 产物（exe 名字已中文化，由 csproj 的 `PublishedExeName` + 发布后重命名目标完成）：
 
-| 版本 | 文件 | 大小 | 目标机要求 |
-|---|---|---|---|
-| 完整版 | `bin\master\局域网配置工具-控制端.exe` | ~64.7 MB | 无（自带运行时） |
-| 完整版 | `bin\slave\局域网配置工具-被控端.exe` | ~63.7 MB | 无 |
-| 精简版 | `bin\master-slim\局域网配置工具-控制端-精简版.exe` | ~2.4 MB | 需 .NET 6 桌面运行时 |
-| 精简版 | `bin\slave-slim\局域网配置工具-被控端-精简版.exe` | ~0.7 MB | 需 .NET 6 桌面运行时 |
+| 文件 | 大小 | 目标机要求 |
+|---|---|---|
+| `bin\master\局域网配置工具-控制端.exe` | ~2.4 MB | .NET 6 桌面运行时（x64） |
+| `bin\slave\局域网配置工具-被控端.exe` | ~0.7 MB | .NET 6 桌面运行时（x64） |
 
-**体积说明**：单文件自包含的 WinForms 应用体积下限就在这里（内置了整个 Windows 桌面运行时）。已做的优化：
-- `EnableCompressionInSingleFile=true`（压缩，原本 ~150 MB）；
-- `SatelliteResourceLanguages=en` 去掉其他语言的卫星程序集（约 -5.5 MB）；
-- 不再打包 PDB 进 exe。
-
-**裁剪（PublishTrimmed）走不通**：SDK 直接报 `NETSDK1175: Windows Forms is not supported or recommended with trimming enabled`，强行绕过会导致运行期反射失效，不建议。
-
-**要更小只能用精简版**：它只含自己的代码 + `e_sqlite3.dll`，运行时用系统安装的 .NET 6 桌面运行时。目标机安装一次即可：
+**只出框架依赖版（不带运行时），exe 名就是正式产品名**：两个工程的 `SelfContained` 都是 `false`，exe 里不带运行时，体积因此从 60 MB 级降到 2 MB 级；`PublishedExeName` 不带任何后缀。代价是**每台目标机必须先装一次 .NET 6 桌面运行时**：
 
 ```powershell
 winget install Microsoft.DotNet.DesktopRuntime.6
 # 或下载：https://dotnet.microsoft.com/download/dotnet/6.0/runtime  （Desktop Runtime x64）
 ```
 
+装运行时的两条实操路径：
+- **装机前**：随镜像一起装，或新机开箱后用 `winget` / 组策略一次性铺开；
+- **装机中**：控制端「文件分发」可以直接把这台机器的离线安装包（`windowsdesktop-runtime-6.0.x-win-x64.exe`）推给被控端静默安装，不用人工跑一圈。
 
-### 构建环境注意（CET / "Unknown Hard Error"）
+**体积说明**：`PublishSingleFile` 把自身程序集 + `e_sqlite3.dll` 打进一个 exe，其余依赖系统运行时。
 
-.NET 9 起 `apphost`/`singlefilehost` 默认带 CET 兼容标记（`/CETCOMPAT`），**未打 CET 补丁的 Windows 上这类程序一启动就 FailFast**，表现为系统弹窗 `Unknown Hard Error` 或 `Fatal error. Your Windows doesn't fully support CET`。
+**裁剪（PublishTrimmed）走不通**：SDK 直接报 `NETSDK1175: Windows Forms is not supported or recommended with trimming enabled`，强行绕过会导致运行期反射失效，不建议。
 
-- 本项目是 net6.0，产出的 exe **不受影响**；出问题的是构建工具链：`pwsh.exe`（PowerShell 7 基于 .NET 10）和 .NET 9/10 版 `dotnet.exe` 都会中招。
-- 因此请用 **.NET 6 SDK** 构建（本机 `C:\Program Files\dotnet` 里就是 6.0.428，可以直接用），不要用 .NET 9/10 SDK；`build.cmd` 只走 `cmd.exe`，不依赖 pwsh。
+
+### 构建环境注意（务必用 .NET 6 SDK）
+
+.NET 9 起 `apphost`/`singlefilehost` 默认带 CET 兼容标记（`/CETCOMPAT`），**在没打 CET 补丁的 Windows 上**这类程序一启动就 FailFast，表现为系统弹窗 `Unknown Hard Error` 或 `Fatal error. Your Windows doesn't fully support CET`。
+
+注意这是**目标机**的兼容性问题，不是本机的构建限制 —— 本机已装 **pwsh 7.6.6**（`C:\Program Files\PowerShell\7`），启动和脚本执行都正常。
+
+- 本项目是 net6.0，产出的 exe **不受影响**，可以直接放到未打补丁的现场机上。
+- 请用 **.NET 6 SDK** 构建。本机 SDK 在 **`D:\ip\.dotnet`（6.0.428）**，`build.cmd` 按「仓库内 `.dotnet` → `C:\Program Files\dotnet` → 用户目录」的顺序查找；这台机器上 `C:\Program Files\dotnet` 并不存在，别照抄旧文档里的路径。
+- 不要用 .NET 9/10 SDK 构建：工具链本身能跑，但产出的 exe 在没打补丁的现场机上会起不来。
+- 构建主流程只用 `cmd.exe`，**不依赖任何 PowerShell 版本**（现场新装的机器未必有 pwsh），这样同一份脚本在哪台机器上都能跑。需要日志 tail / Unblock-File 时优先用 pwsh 7、缺失才回退系统自带的 `powershell` 5.1 —— 这不是可有可无的讲究：5.1 按 OEM 代码页读 UTF-8 日志，中文会整段变成乱码（实测 `鍏佽…`），只有 pwsh 7 读得对。
 - 两个 exe 工程已加 `<CETCompat>false</CETCompat>`，即使以后用 .NET 9+ SDK 重新构建，产出的 apphost 也不会带 CET 标记。
-- 彻底修复本机：安装 Windows 更新；或在「Windows 安全中心 → 应用和浏览器控制 → 漏洞防护 → 程序设置」里给 `pwsh.exe` 关闭「硬件强制堆栈保护」；或直接用 Windows PowerShell 5.1。
 
 ## 目录结构
 
@@ -142,10 +141,8 @@ LanAutoConfig/
 │   ├── HeartbeatService.cs       # 心跳（每 10 秒，带身份令牌）；退出前发“下线通知”
 │   └── LocalNetChanger.cs        # 本地 PowerShell：静态IP/DHCP/改名/重启
 └── bin/
-    ├── master\局域网配置工具-控制端.exe             # 完整版（自带运行时，~62 MB）
-    ├── slave\局域网配置工具-被控端.exe
-    ├── master-slim\局域网配置工具-控制端-精简版.exe  # 需 .NET 6 桌面运行时
-    └── slave-slim\局域网配置工具-被控端-精简版.exe
+    ├── master\局域网配置工具-控制端.exe   # 框架依赖，~2.4 MB（需 .NET 6 桌面运行时）
+    └── slave\局域网配置工具-被控端.exe    # 框架依赖，~0.7 MB
 ```
 
 ## 数据与日志
@@ -157,7 +154,7 @@ LanAutoConfig/
 
 ## 说明与偏离记录
 
-- 文档约定“脚本调用 System.Management.Automation”。本实现为兼容**单文件自包含发布**（该 SDK 包体积大、含原生库，单文件发布麻烦），改为调用本地 `powershell.exe -EncodedCommand` 执行脚本，功能与结果等价（本地执行、无远程凭据）。若你确实需要改为 System.Management.Automation，告诉我即可切换。
+- 文档约定“脚本调用 System.Management.Automation”。本实现为兼容**单文件发布**（该 SDK 包体积大、含原生库，单文件发布麻烦），改为调用本地 `powershell.exe -EncodedCommand` 执行脚本，功能与结果等价（本地执行、无远程凭据）。若你确实需要改为 System.Management.Automation，告诉我即可切换。
 - 修改计算机名仍需重启才完全生效；程序在执行成功后提示重启（可勾选自动重启）。
 - 仅限同一局域网 / 工作组（域环境也兼容，仅改本机本地主机名，不做 AD 操作）；不做公网穿透、不做端口扫描、不自动抓全网主机。
 
@@ -291,12 +288,12 @@ v1.7：
 v1.8：
 
 38. **程序名改为中文**：
-    - 控制端 `局域网配置工具-控制端.exe`、被控端 `局域网配置工具-被控端.exe`（精简版带 `-精简版` 后缀）；
+    - 控制端 `局域网配置工具-控制端.exe`、被控端 `局域网配置工具-被控端.exe`；
     - 实现方式：程序集名保持 ASCII（`LanAutoConfigMaster`/`Slave`，避免工具链兼容问题），csproj 里用 `PublishedExeName` + `AfterTargets="Publish"` 的 `Move` 目标在发布后改名；
     - 窗口标题同步改为「局域网配置工具 - 控制端 / 被控端」。
-39. **体积优化**：`SatelliteResourceLanguages=en` 去掉其他语言的卫星程序集，控制端 67.1 MB → **61.6 MB**、被控端 66.2 MB → **60.6 MB**；另提供**精简版**（框架依赖）控制端 2.1 MB / 被控端 0.3 MB，需目标机安装 .NET 6 桌面运行时。
+39. **体积优化**：`SatelliteResourceLanguages=en` 去掉其他语言的卫星程序集，控制端 67.1 MB → **61.6 MB**、被控端 66.2 MB → **60.6 MB**；另提供**精简版**（框架依赖）控制端 2.1 MB / 被控端 0.3 MB，需目标机安装 .NET 6 桌面运行时。（现只出这一种形式，但 exe 名不再带「精简版」后缀，见第 103、104 条。）
     - `PublishTrimmed` 不可用：SDK 直接报 `NETSDK1175`（WinForms 不支持裁剪），强行绕过会造成运行期反射失效。
-40. **build.cmd 一次产出四份**：完整版 + 精简版，并自动 Unblock；`tools/sign.ps1` 改为自动遍历 `bin` 下所有 exe（不再写死文件名）。
+40. **build.cmd 一次产出四份**：完整版 + 精简版，并自动 Unblock；`tools/sign.ps1` 改为自动遍历 `bin` 下所有 exe（不再写死文件名）。（现只出两份框架依赖版，见「构建」章节。）
 
 v1.9：
 
@@ -745,3 +742,29 @@ v3.0（资产 / 在线状态 / 白名单，本轮进行中）：
     导致每改一次 IP 就加一个临时同网段地址。现在回传原则是**先直连、真失败了才动网卡**：
     先用现有地址直接回传（3 次重试），全部失败且勾选了该选项时才解析/添加临时地址再重试；
     勾选框提示文案同步改为"只有当通信确实失败时才临时改网卡，通信正常时不会修改网卡"。
+
+103. **交付形式统一为「精简版」（框架依赖），不再出自包含版**（`Master/Master.csproj`、`Slave/Slave.csproj`、`build.cmd`）：
+    - 两个工程 `SelfContained` 改为 `false`、`EnableCompressionInSingleFile` 改为 `false`（框架依赖没有运行时可压，开着只拖慢启动），
+      删除 `SlimBuild` 条件属性——**默认发布就是精简版**，不会有人手滑跑出另一种形态；
+    - `PublishedExeName` 直接写成带 `-精简版` 后缀的名字，产物落在 `bin\master-slim` / `bin\slave-slim`：
+      控制端 **2.36 MB**、被控端 **0.67 MB**（自包含版是 64.7 MB / 63.7 MB，约 1/27）；（`-精简版` 后缀与目录名后来撤销，见第 104 条。）
+    - `build.cmd` 的 publish 步骤全部加 `--self-contained false`，结尾会打印 `NEEDS: .NET 6 Desktop Runtime (x64)` 提醒；
+    - **代价**：每台目标机必须先装 .NET 6 桌面运行时（x64）。批量铺开两条路：随镜像预装，或用控制端「文件分发」
+      把 `windowsdesktop-runtime-6.0.x-win-x64.exe` 推给被控端静默安装（`msiexec`/静默参数已由文件分发功能支持）；
+    - 顺带好处：体积降到 1/27 后，现场几十台通过 HTTP 48890 拉**自升级包**的时间同比缩短，升级窗口更容易压住。
+
+104. **exe 名恢复为正式产品名，去掉 `-精简版` 后缀**（`Master/Master.csproj`、`Slave/Slave.csproj`、`build.cmd`）：
+    - `PublishedExeName` 改回 `局域网配置工具-控制端` / `局域网配置工具-被控端`，产物目录回到 `bin\master` / `bin\slave`：
+      现场交付物就是 `bin\master\局域网配置工具-控制端.exe`、`bin\slave\局域网配置工具-被控端.exe`；
+    - **仍然不带运行时**（`SelfContained=false` 不变）——去掉的只是名字后缀，不是框架依赖这个属性；
+    - 之所以要恢复正式名：被控端自升级、开机自启、快捷方式、现场纸质/口述操作指引里用的都是正式名，
+      带后缀会让人以为还有一个「非精简版」需要选择，实际只有一个交付形态；
+    - 重建验证：`build.cmd` 全流程 `0 警告 0 错误`，产物 2,356,556 B / 671,867 B，`.cmd` 仍为纯 ASCII（0 个 >127 字节）。
+
+105. **被控端后缀框支持回车提交上报**（`Slave/SlaveForm.cs`）：
+    - 新增 `_txtSuffix_KeyDown`，在后缀编号框里按回车等同于点【提交上报】；实现是 `_btnSubmit.PerformClick()`，
+      **复用 Click 里的全部校验与上报流程**（模板缺失、后缀非法、网卡未选、互连探测、重试都走同一条路），没有第二份逻辑；
+    - `e.SuppressKeyPress = true` 吞掉回车：既消掉系统提示音，也避免将来给窗体设了 `AcceptButton` 时同一回车被处理两次、报两遍；
+    - 两个静默忽略：按钮未启用（没收到模板/已上报过）时直接 return；编号为空时也 return，不弹校验框——避免随手按回车弹一堆提示；
+    - 状态栏提示改为「已收到模板，请输入后缀编号并上报（输完按回车即可）」，让这个快捷方式在界面上可发现；
+    - 未设 `AcceptButton`：回车只作用于后缀框，不扩大到整窗体，避免焦点在别的控件上误触发上报。

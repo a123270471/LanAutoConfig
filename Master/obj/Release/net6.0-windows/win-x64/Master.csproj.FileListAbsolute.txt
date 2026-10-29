@@ -15,9 +15,9 @@ D:\ip\LanAutoConfig\Master\obj\Release\net6.0-windows\win-x64\Master.GeneratedMS
 D:\ip\LanAutoConfig\Master\obj\Release\net6.0-windows\win-x64\Master.AssemblyInfoInputs.cache
 D:\ip\LanAutoConfig\Master\obj\Release\net6.0-windows\win-x64\Master.AssemblyInfo.cs
 D:\ip\LanAutoConfig\Master\obj\Release\net6.0-windows\win-x64\Master.csproj.CoreCompileInputs.cache
-D:\ip\LanAutoConfig\Master\obj\Release\net6.0-windows\win-x64\Master.csproj.CopyComplete
 D:\ip\LanAutoConfig\Master\obj\Release\net6.0-windows\win-x64\LanAutoConfigMaster.dll
 D:\ip\LanAutoConfig\Master\obj\Release\net6.0-windows\win-x64\refint\LanAutoConfigMaster.dll
 D:\ip\LanAutoConfig\Master\obj\Release\net6.0-windows\win-x64\LanAutoConfigMaster.pdb
 D:\ip\LanAutoConfig\Master\obj\Release\net6.0-windows\win-x64\Master.genruntimeconfig.cache
 D:\ip\LanAutoConfig\Master\obj\Release\net6.0-windows\win-x64\ref\LanAutoConfigMaster.dll
+D:\ip\LanAutoConfig\Master\obj\Release\net6.0-windows\win-x64\Master.csproj.CopyComplete

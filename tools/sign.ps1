@@ -29,7 +29,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-# 自动找出 bin 下所有 exe（完整版 / 精简版都在内），文件名已改成中文
+# 自动找出 bin 下所有 exe，文件名已改成中文正式名
 $exes = @(Get-ChildItem -LiteralPath (Join-Path $root 'bin') -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
           Select-Object -ExpandProperty FullName)
 if ($exes.Count -eq 0) { Write-Host "bin 下没有找到 exe，请先运行 build.cmd 或 dotnet publish。" -ForegroundColor Yellow; return }

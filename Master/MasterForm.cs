@@ -87,6 +87,14 @@ namespace LanAutoConfig.Master
         /// <summary>发号失败日志的节流表（同一台 30 秒内只记一条，否则每秒刷屏）。</summary>
         private readonly Dictionary<string, DateTime> _autoNumberFailLog
             = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// 已经放弃发号的终端（连发 3 次都没上报，通常是入站 48889 被防火墙拦）。
+        /// 必须单独记住：否则它每轮都会重新满足“在线 + 无编号 + 不在待确认表”的条件，
+        /// 于是又被发一个新号、再失败、再放弃 —— 一台机器就能把 253 个编号全部吃光，
+        /// 最后触发“编号已用尽”把自动编号整个关掉。重新开关自动编号时清空。
+        /// </summary>
+        private readonly HashSet<string> _autoNumberAbandoned
+            = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private CheckBox _chkAutoNumber;
         private NumericUpDown _numAutoStart;
         /// <summary>“下一个编号”的小字提示（勾选后才有内容）。</summary>
@@ -353,7 +361,7 @@ namespace LanAutoConfig.Master
         /// 把指令发给某一台终端：自动带上该终端的身份令牌、用广播网卡作源地址。
         /// 所有“单台下发”都走这里 —— 避免哪个分支漏带令牌，被被控端当成伪造指令直接丢弃。
         /// </summary>
-        private bool SendToItem(SlaveSessionItem it, NetMessage msg, out string error)
+        private bool SendToItem(SlaveSessionItem it, NetMessage msg, out string error, int timeoutMs = 0)
         {
             error = null;
             if (it == null) { error = "终端为空"; return false; }
@@ -367,7 +375,7 @@ namespace LanAutoConfig.Master
             }
             msg.Token = it.AuthToken;
             return TcpSend.SendTo(target, AppConfig.TcpPort, msg,
-                SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4(), out error);
+                SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4(), out error, timeoutMs);
         }
 
         /// <summary>向单台终端下发自定义命令/脚本。</summary>
@@ -1329,6 +1337,7 @@ namespace LanAutoConfig.Master
                 _autoNumberNext = (int)_numAutoStart.Value;
                 _autoNumberPending.Clear();
                 _autoNumberFailLog.Clear();
+                _autoNumberAbandoned.Clear();   // 重新开启视为“再给所有机器一次机会”
                 _autoNumberTimer.Start();
                 LogLine($"自动编号已开启：从 {_autoNumberNext:00} 开始，按上线先后自动发号（被控端收到后自动上报）");
                 AutoNumberTick();      // 立刻处理已经在线的机器，不用等下一秒
@@ -1338,6 +1347,7 @@ namespace LanAutoConfig.Master
                 _autoNumberTimer.Stop();
                 _autoNumberPending.Clear();
                 _autoNumberFailLog.Clear();
+                _autoNumberAbandoned.Clear();
                 LogLine("自动编号已关闭");
             }
 
@@ -1380,6 +1390,7 @@ namespace LanAutoConfig.Master
         {
             _autoNumberPending.Clear();
             _autoNumberFailLog.Clear();
+            _autoNumberAbandoned.Clear();
             _autoNumberNext = (int)(_numAutoStart?.Value ?? 1);
             UpdateAutoNumberHint();
         }
@@ -1413,11 +1424,14 @@ namespace LanAutoConfig.Master
                     if (kv.Value.Attempts >= 3)
                     {
                         _autoNumberPending.Remove(kv.Key);
+                        _autoNumberAbandoned.Add(kv.Key);   // 记住它，别再发号（见字段注释）
                         LogLine($"[自动编号] {it.Mac} 连发 3 次都没有上报，跳过（请看它是否在线、防火墙是否放行 TCP {AppConfig.TcpPort}）");
                         continue;
                     }
                     var again = new MasterAssignSuffixCmdMsg(_session.SessionId, it.Mac, kv.Value.Suffix);
-                    bool ok = SendToItem(it, again, out string err2);
+                    // 这个 tick 跑在 UI 线程上，用 1.5 秒短超时：默认的 5 秒 × 2 次重试会让
+                    // 一台连不上的机器把整个窗口冻住 10 秒。发不出去的号 15 秒后还会再试。
+                    bool ok = SendToItem(it, again, out string err2, 1500);
                     if (ok) _autoNumberPending[kv.Key] = (kv.Value.Suffix, kv.Value.Attempts + 1, now);
                     else
                     {
@@ -1435,7 +1449,8 @@ namespace LanAutoConfig.Master
                     .Where(x => x.Online                       // 只给“此刻真的在线”的机器发号，关机中的机器不去打扰
                                 && x.Status == SlaveStatus.Online
                                 && string.IsNullOrWhiteSpace(x.Suffix)
-                                && !_autoNumberPending.ContainsKey(x.Mac))
+                                && !_autoNumberPending.ContainsKey(x.Mac)
+                                && !_autoNumberAbandoned.Contains(x.Mac))   // 已经放弃过的别再吃号
                     .ToList();
                 if (candidates.Count == 0) { UpdateAutoNumberHint(); return; }
 
@@ -1448,7 +1463,7 @@ namespace LanAutoConfig.Master
                     string suffix = _autoNumberNext.ToString("00");
                     var cmd = new MasterAssignSuffixCmdMsg(_session.SessionId, it.Mac, suffix);
                     string where = it.SourceIp ?? it.TargetIp ?? "-";
-                    if (SendToItem(it, cmd, out string err))
+                    if (SendToItem(it, cmd, out string err, 1500))
                     {
                         used.Add(_autoNumberNext);
                         it.Suffix = suffix;    // 先把界面点亮；以它上报回来的为准

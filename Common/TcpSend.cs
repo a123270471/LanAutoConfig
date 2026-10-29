@@ -59,10 +59,14 @@ namespace LanAutoConfig.Common
 
         /// <summary>
         /// 同上，但把失败原因（socket 错误码/超时/绑定失败）通过 error 带回，便于日志定位。
+        /// timeoutMs &lt;= 0 时用默认的 <see cref="AppConfig.TcpTimeoutMs"/>；
+        /// 调用方在 UI 线程上批量发指令（如自动编号每秒扫一遍）时应传一个更短的值，
+        /// 否则单台连不上的终端就能把界面冻住两个超时周期。
         /// </summary>
-        public static bool SendTo(string ip, int port, NetMessage msg, string bindLocalIp, out string error)
+        public static bool SendTo(string ip, int port, NetMessage msg, string bindLocalIp, out string error, int timeoutMs = 0)
         {
             error = null;
+            if (timeoutMs <= 0) timeoutMs = AppConfig.TcpTimeoutMs;
             if (string.IsNullOrWhiteSpace(ip)) { error = "目标 IP 为空"; return false; }
             if (!IPAddress.TryParse(ip, out IPAddress dest)) { error = $"目标地址不合法：{ip}"; return false; }
             if (msg == null) { error = "消息为空"; return false; }
@@ -76,17 +80,17 @@ namespace LanAutoConfig.Common
                 if (bindError != null) error = bindError;
 
                     Task connectTask = client.ConnectAsync(dest, port);
-                    if (!WaitWithTimeout(connectTask, AppConfig.TcpTimeoutMs))
+                    if (!WaitWithTimeout(connectTask, timeoutMs))
                     {
                         ObserveFault(connectTask);
                         try { client.Close(); } catch { }
-                        error = $"连接 {ip}:{port} 超时（{AppConfig.TcpTimeoutMs} 毫秒无响应，通常是对方防火墙丢包或路由不对）";
+                        error = $"连接 {ip}:{port} 超时（{timeoutMs} 毫秒无响应，通常是对方防火墙丢包或路由不对）";
                         continue;                              // 超时：下一轮重试
                     }
                     connectTask.GetAwaiter().GetResult();      // 失败时抛出 SocketException
 
                     client.NoDelay = true;
-                    client.SendTimeout = AppConfig.TcpTimeoutMs;
+                    client.SendTimeout = timeoutMs;
 
                     string json = JsonHelper.Serialize(msg);
                     byte[] bytes = Encoding.UTF8.GetBytes(json + "\n");
