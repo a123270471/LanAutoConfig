@@ -206,9 +206,71 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
 
         /// <summary>重启本机。force=true 时强制关闭应用程序。</summary>
         public PsResult Reboot(bool force)
+            => RunShutdown(force ? "/r /t 5 /f" : "/r /t 5");
+
+        /// <summary>
+        /// 重启 / 关机：delay 秒后执行。返回是否成功提交，失败时 error 带原因。
+        /// 被控端所有“重启电脑 / 关机”都走这里，统一不经 PowerShell（见 RunShutdown 注释）。
+        /// </summary>
+        public static bool Shutdown(int delaySeconds, bool reboot, out string error)
         {
-            string args = force ? "/r /t 5 /f" : "/r /t 5";
-            return RunPs($"shutdown {args}");
+            int d = Math.Max(0, Math.Min(600, delaySeconds));
+            var r = RunShutdown(reboot ? $"/r /t {d} /f" : $"/s /t {d} /f");
+            error = r.Success ? null : (string.IsNullOrEmpty(r.Error) ? "shutdown 未完成" : r.Error);
+            return r.Success;
+        }
+
+        /// <summary>
+        /// 直接调 shutdown.exe，**不经过 PowerShell**。
+        ///
+        /// 之前是 RunPs("shutdown ...")：PowerShell 作为父进程活着等子进程返回，
+        /// 系统几秒后开始关机时它还没退干净，于是屏幕上弹出 PowerShell 的错误窗
+        /// （现场看到的就是“重启时蹦出一个 PowerShell 报错”）。
+        /// shutdown.exe 自己拉起、自己退出，没有这个中间层。
+        /// </summary>
+        private static PsResult RunShutdown(string args)
+        {
+            var result = new PsResult();
+            try
+            {
+                var psi = new ProcessStartInfo("shutdown.exe", args)
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    StandardOutputEncoding = ConsoleText.Oem,
+                    StandardErrorEncoding = ConsoleText.Oem
+                };
+                using var p = Process.Start(psi);
+                if (p == null) { result.Error = "无法启动 shutdown.exe"; return result; }
+
+                var outTask = p.StandardOutput.ReadToEndAsync();
+                var errTask = p.StandardError.ReadToEndAsync();
+                if (!p.WaitForExit(15000))
+                {
+                    try { p.Kill(true); } catch { }
+                    result.Success = true;   // 关机已在进行，shutdown 挂住是正常的
+                    result.Output = "shutdown 已提交（进程未在 15 秒内返回，按成功处理）";
+                    return result;
+                }
+
+                result.Output = (outTask.GetAwaiter().GetResult() ?? "").Trim();
+                result.Error = (errTask.GetAwaiter().GetResult() ?? "").Trim();
+                result.ExitCode = p.ExitCode;
+
+                // 0 = 成功；1190 = 已有计划中的关机；1115 = 关机已在进行
+                result.Success = p.ExitCode == 0 || p.ExitCode == 1190 || p.ExitCode == 1115;
+                if (!result.Success && string.IsNullOrEmpty(result.Error))
+                    result.Error = $"shutdown 退出码 {p.ExitCode}";
+                return result;
+            }
+            catch (Exception ex)
+            {
+                result.Error = ex.Message;
+                return result;
+            }
         }
 
         /// <summary>

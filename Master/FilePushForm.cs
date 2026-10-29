@@ -250,7 +250,8 @@ namespace LanAutoConfig.Master
             }
             if (self && MessageBox.Show(this,
                     $"让 {targets.Count} 台终端把自己的程序替换成 {_fileName}？\n\n" +
-                    "被控端会：下载 → 校验 SHA256 → 退出自己 → 批处理等进程结束后替换 → 重新启动。\n" +
+                    "被控端会：下载 → 校验 SHA256 → 自己退出 → 批处理等进程结束后替换 → 自动重新启动。\n" +
+                    "**被控端不会再弹窗问“是否升级”**（现场几十台没法一台台点），点了这里就是直接换。\n" +
                     "推错文件会导致这些机器再也连不上，建议先拿 1 台试。", "自升级",
                     MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
 

@@ -183,20 +183,15 @@ namespace LanAutoConfig.Slave
             if (!IsForThisMachine(cmd.LocalMac, "重启"))
                 return;
             int delay = Math.Max(0, Math.Min(600, cmd.DelaySeconds));
-            try
+            if (LocalNetChanger.Shutdown(delay, true, out string err))
             {
-                Process.Start(new ProcessStartInfo("shutdown", $"/r /t {delay} /f")
-                {
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                });
                 _lblStatus.Text = $"已收到重启指令，{delay} 秒后重启";
                 LogLine($"已执行重启：{delay} 秒后重启（shutdown /r /t {delay} /f）");
             }
-            catch (Exception ex)
+            else
             {
                 _lblStatus.Text = "重启指令执行失败";
-                LogLine("重启失败：" + ex.Message);
+                LogLine($"重启失败：{err}（如提示权限不足，请确认被控端是“以管理员身份”运行）");
             }
         }
 
@@ -250,21 +245,16 @@ namespace LanAutoConfig.Slave
             if (!IsForThisMachine(cmd.LocalMac, "关机"))
                 return;
             int delay = Math.Max(0, Math.Min(600, cmd.DelaySeconds));
-            try
+            if (LocalNetChanger.Shutdown(delay, false, out string err))
             {
-                Process.Start(new ProcessStartInfo("shutdown", $"/s /t {delay} /f")
-                {
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                });
                 _lblStatus.Text = $"已收到关机指令，{delay} 秒后关机";
                 LogLine($"已执行关机：{delay} 秒后关机（shutdown /s /t {delay} /f）。如需取消：" +
                         $"在本机执行 shutdown /a");
             }
-            catch (Exception ex)
+            else
             {
                 _lblStatus.Text = "关机指令执行失败";
-                LogLine("关机失败：" + ex.Message);
+                LogLine($"关机失败：{err}");
             }
         }
 
@@ -576,19 +566,9 @@ namespace LanAutoConfig.Slave
             if (!IsForThisMachine(cmd.LocalMac, "自升级")) return;
             if (string.IsNullOrEmpty(_masterIp)) return;
 
-            if (!_options.Silent &&
-                MessageBox.Show($"控制端要求把被控端程序升级到新版本（{cmd.SizeBytes / 1024} KB）。\n\n" +
-                                "下载并校验通过后会自动替换并重启本程序，期间屏幕可能闪一下。现在升级吗？",
-                    "远程升级", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
-            {
-                LogLine("操作员拒绝了自升级");
-                var no = new SlaveFileResultMsg(_sessionId)
-                {
-                    LocalMac = cmd.LocalMac, FileName = "自升级", Success = false, Message = "操作员在本机拒绝了升级"
-                };
-                SendToMaster(no);
-                return;
-            }
+            // 不再在本机弹“是否升级”的确认框：装机现场几十台，一台一台去点是做不完的，
+            // 而且这个指令只有控制端能发（带令牌）。风险改由控制端那边确认台数 + 先拿 1 台试来控。
+            LogLine($"收到自升级指令（{cmd.SizeBytes / 1024} KB），开始下载…");
 
             string adapterAlias = (_cmbAdapter?.SelectedItem as NetworkAdapterInfo)?.Alias;
             _lblStatus.Text = "正在下载新版本…";
@@ -670,19 +650,14 @@ namespace LanAutoConfig.Slave
             });
         }
 
-        /// <summary>控制端要求“重启本程序”或“退出本程序”（换 exe / 清场用）。</summary>
+        /// <summary>
+        /// 控制端要求“重启本程序”（换 exe / 重读本地配置用）。
+        /// 注意：不再提供“退出被控端”指令 —— 退出后这台机器就彻底失联，只能现场处理，
+        /// 保留它只会让误点变成事故；需要停用时在机器上手动关，或直接关机。
+        /// </summary>
         private void OnProcCommand(MasterProcCmdMsg cmd)
         {
             if (!IsForThisMachine(cmd.LocalMac, "程序控制")) return;
-            string action = (cmd.Action ?? "").Trim().ToLowerInvariant();
-
-            if (action == "exit")
-            {
-                LogLine("按控制端指令退出被控端程序");
-                Program.ReleaseSingleInstance();
-                Application.Exit();
-                return;
-            }
 
             LogLine("按控制端指令重启被控端程序…");
             try

@@ -6,7 +6,7 @@ namespace LanAutoConfig.Master
     public class MasterForm : Form
     {
         /// <summary>下发后多久没收到结果就判定超时（覆盖被控端 PowerShell 60s 超时 + 网络切换）。</summary>
-        private const int SweepTimeoutSeconds = 120;
+        private const int SweepTimeoutSeconds = 300;   // 加域/慢盘可能要几分钟，别在它还在跑时就判失败
         private const int SweepIntervalMs = 5000;
 
         private readonly SessionManager _session = new SessionManager();
@@ -506,18 +506,17 @@ namespace LanAutoConfig.Master
             return SendToItem(it, cmd, out error);
         }
 
-        /// <summary>批量下发“重启/退出被控端程序”。</summary>
-        internal void SendProcCmd(IReadOnlyList<SlaveSessionItem> items, string action)
+        /// <summary>批量下发“重启被控端程序”（只重开程序，不重启电脑）。</summary>
+        internal void RestartSlaveApp(IReadOnlyList<SlaveSessionItem> items)
         {
             if (items == null || items.Count == 0) return;
-            string what = action == "exit" ? "退出" : "重启";
             SendBatchBackground(items, it =>
             {
-                var cmd = new MasterProcCmdMsg(_session.SessionId) { LocalMac = it.Mac, Action = action };
+                var cmd = new MasterProcCmdMsg(_session.SessionId) { LocalMac = it.Mac, Action = "restart" };
                 if (SendToItem(it, cmd, out string err)) return true;
-                LogLine($"[程序] {it.TargetHostName}（{it.Mac}）{what}指令下发失败：{err}");
+                LogLine($"[程序] {it.TargetHostName}（{it.Mac}）重启指令下发失败：{err}");
                 return false;
-            }, (ok, fail) => LogLine($"被控端{what}：成功下发 {ok} 台，失败 {fail} 台"));
+            }, (ok, fail) => LogLine($"重启被控端程序：成功下发 {ok} 台，失败 {fail} 台"));
         }
 
         /// <summary>流水线用：批量重启（后台发送，不阻塞）。</summary>
@@ -581,6 +580,10 @@ namespace LanAutoConfig.Master
                 return;
             }
             var rec = _session.MarkResult(m);
+
+            // 直接把结果喂给流水线：不能靠“每秒去列表里读状态”——机器重启后重新上报会把状态复位成
+            // Reported，中间错过一拍就再也读不到“成功”，整轮会被误判成 0 台成功。
+            try { _provision?.NotifyExecResult(m.LocalMac, m.Success, m.ErrorMsg); } catch { }
             // 成功后清掉上一次失败留下的归类，避免“已成功却还显示旧错误类别”
             if (m.Success)
             {
@@ -1071,10 +1074,23 @@ namespace LanAutoConfig.Master
         private sealed class MasterProvisionOps : IProvisionOps
         {
             private readonly MasterForm _f;
+            private volatile bool _busy;
+
             public MasterProvisionOps(MasterForm f) { _f = f; }
 
+            /// <summary>下发还在进行中时，状态机不能判定“没送达”（否则会边发边重发）。</summary>
+            public bool Busy => _busy;
+
             public void Dispatch(IReadOnlyList<SlaveSessionItem> items)
-                => Task.Run(() => _f.DispatchExecute(items));
+            {
+                _busy = true;
+                Task.Run(() =>
+                {
+                    try { _f.DispatchExecute(items); }
+                    catch (Exception ex) { _f.SafeUi(() => _f.LogLine("[流水线] 下发异常：" + ex.Message)); }
+                    finally { _busy = false; }
+                });
+            }
 
             public void Reboot(IReadOnlyList<SlaveSessionItem> items)
                 => _f.RebootItems(items, _f._provision?.Options.RebootDelaySec ?? 10);
@@ -2351,17 +2367,7 @@ namespace LanAutoConfig.Master
                 if (MessageBox.Show($"让选中的 {items.Count} 台终端重启被控端程序？（不重启电脑，只重开程序）\n\n" +
                                     "适用于程序卡住、或需要重新读一次本地配置的情况。", "重启被控端",
                         MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
-                SendProcCmd(items, "restart");
-            };
-            var btnQuit = new Button { Text = "退出被控端", Width = 110, Height = 32 };
-            btnQuit.Click += (s, e) =>
-            {
-                var items = SelectedItemsOrAllOnline();
-                if (items.Count == 0) { MessageBox.Show("没有可操作的终端。", "提示"); return; }
-                if (MessageBox.Show($"让选中的 {items.Count} 台终端退出被控端程序？\n\n" +
-                                    "退出后这些机器将不再响应任何指令，需要现场或开机自启重新拉起。", "退出被控端",
-                        MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
-                SendProcCmd(items, "exit");
+                RestartSlaveApp(items);
             };
             var btnIpScan = new Button { Text = "IP占用扫描", Width = 110, Height = 32 };
             btnIpScan.Click += (s, e) => ShowIpScanDialog();
@@ -2372,14 +2378,12 @@ namespace LanAutoConfig.Master
             tipBar.SetToolTip(btnFilePush, "把安装包/脚本推到被控端并静默执行（内置文件服务，带 SHA256 校验）");
             tipBar.SetToolTip(btnShot, "让被控端截一张当前桌面回传，看它卡在哪个界面");
             tipBar.SetToolTip(btnProc, "只重启被控端程序（不重启电脑），程序卡死时用");
-            tipBar.SetToolTip(btnQuit, "让被控端程序退出（慎用：退出后不再响应指令）");
             tipBar.SetToolTip(btnIpScan, "扫描目标 IP 在网段里是否已被别的机器占用（读 ARP 表，能发现模板冲突之外的“老机器占地址”）");
             tipBar.SetToolTip(btnProbe, "同时探 ping 和 48889 端口：分清是掉线、还是机器在但被控端没跑/被防火墙拦");
             bar2.Controls.Add(btnProvision);
             bar2.Controls.Add(btnFilePush);
             bar2.Controls.Add(btnShot);
             bar2.Controls.Add(btnProc);
-            bar2.Controls.Add(btnQuit);
             bar2.Controls.Add(btnIpScan);
             bar2.Controls.Add(btnProbe);
 

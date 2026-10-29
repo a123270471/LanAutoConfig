@@ -91,7 +91,7 @@ namespace LanAutoConfig.Master
             {
                 Dock = DockStyle.Fill,
                 AutoSize = false,
-                Text = "提示：下发后 20 秒内没进入“执行中”的，按下发失败处理并自动重试（多半是那台机器连不上控制端）。",
+                Text = "提示：会等机器上线并上报；下发后 20 秒没结果的按“没送达”重发（只重发失败的那几台）。",
                 ForeColor = System.Drawing.Color.DimGray
             };
             tbl.Controls.Add(lblTip, 0, 4);
@@ -103,7 +103,7 @@ namespace LanAutoConfig.Master
             // ---- 目标范围 ----
             var grpTarget = new GroupBox { Text = "跑哪些机器", Dock = DockStyle.Fill };
             var barTarget = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Padding = new Padding(8, 4, 8, 4) };
-            _rbAll = new RadioButton { Text = "全部（含还没上报的，推荐）", Checked = true, AutoSize = true };
+            _rbAll = new RadioButton { Text = "全部（没开机的会等它上线，推荐）", Checked = true, AutoSize = true };
             _rbReported = new RadioButton { Text = "仅已上报待执行的", AutoSize = true };
             _rbSelected = new RadioButton { Text = "仅列表里选中的", AutoSize = true };
             barTarget.Controls.Add(_rbAll);
