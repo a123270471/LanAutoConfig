@@ -20,6 +20,12 @@ namespace LanAutoConfig.Common
         public const string SlaveCustomResult = "SlaveCustomResult"; // TCP：被控端回传自定义命令执行结果
         public const string MasterVerifyCmd   = "MasterVerifyCmd";   // TCP：控制端要求被控端上报当前实际配置（用于重启后自动验收）
         public const string SlaveVerifyResult = "SlaveVerifyResult"; // TCP：被控端回传当前实际配置
+        public const string MasterFilePush    = "MasterFilePushCmd";  // TCP：控制端下发文件（安装包/脚本/驱动）
+        public const string SlaveFileResult   = "SlaveFileResult";    // TCP：被控端回传文件下载/执行结果
+        public const string MasterSelfUpdate  = "MasterSelfUpdateCmd";// TCP：控制端下发改程序（自升级）
+        public const string MasterScreenshot  = "MasterScreenshotCmd";// TCP：控制端要求截屏
+        public const string SlaveScreenshot   = "SlaveScreenshotResult";// TCP：被控端回传截屏
+        public const string MasterProcCmd     = "MasterProcCmd";      // TCP：控制端要求被控端程序重启/退出
     }
 
     /// <summary>
@@ -32,6 +38,20 @@ namespace LanAutoConfig.Common
         public string SessionId { get; set; }
         public string Magic { get; set; } = AppConfig.Magic;
         public long Check { get; set; }
+
+        /// <summary>
+        /// 本机身份令牌（每台被控端一个随机值，首次运行生成并写进本地偏好，之后固定不变）。
+        ///
+        /// 为什么不是“会话令牌”：会话令牌必须在广播模板里下发，而 UDP 广播同网段每台机器都能收到，
+        /// 拿到令牌就能伪造成控制端 —— 等于没有防护。这里的令牌恰好相反：
+        ///   · 被控端只在“上报/心跳”里把它<b>单播</b>告诉控制端，从不在广播里出现；
+        ///   · 控制端把它记在终端列表里，之后每条指令都原样带回；
+        ///   · 被控端收到指令时校验“带回来的令牌 == 本机令牌”，不符直接丢弃。
+        /// 于是同网段其它机器（包括同网段的另一台被控端）即使知道协议格式、能收到广播，
+        /// 也不知道这台的令牌，无法伪造“改 IP / 执行脚本 / 重启”这类破坏性指令。
+        /// 局限：交换机端口镜像/ARP 欺骗能看到单播流量，这是明文协议的固有边界。
+        /// </summary>
+        public string Token { get; set; }
 
         /// <summary>
         /// 接收方观测到的“对端真实来源 IP”，由 TCP 服务端在收到消息时填入。
@@ -48,13 +68,30 @@ namespace LanAutoConfig.Common
         /// <summary>参与校验的稳定字段（子类实现），用于简单校验码计算。</summary>
         protected abstract string StableBody();
 
-        public void ComputeCheck() => Check = Fnv1a($"{MsgType}|{SessionId}|{Magic}|{StableBody()}");
+        public void ComputeCheck() => Check = Fnv1a($"{MsgType}|{SessionId}|{Magic}|{Token}|{StableBody()}");
 
         /// <summary>校验 Magic 与 Check，过滤无关程序/伪造消息。</summary>
-        public bool Validate()
+        public bool Validate() => ValidateEx(out _);
+
+        /// <summary>
+        /// 同 <see cref="Validate()"/>，并给出人能看懂的原因（现场排查用：
+        /// “校验失败”三个字没法区分是版本不一致还是消息被改过）。
+        /// </summary>
+        public bool ValidateEx(out string reason)
         {
-            if (Magic != AppConfig.Magic) return false;
-            return Check == Fnv1a($"{MsgType}|{SessionId}|{Magic}|{StableBody()}");
+            reason = null;
+            if (Magic != AppConfig.Magic)
+            {
+                reason = $"协议版本不一致（对方 {Magic ?? "空"}，本机 {AppConfig.Magic}）—— 请把两端都换成同一版本的程序";
+                return false;
+            }
+            long expect = Fnv1a($"{MsgType}|{SessionId}|{Magic}|{Token}|{StableBody()}");
+            if (Check != expect)
+            {
+                reason = "校验码不匹配（版本不一致，或消息内容被修改/丢包截断）";
+                return false;
+            }
+            return true;
         }
 
         private static long Fnv1a(string s)
@@ -81,19 +118,27 @@ namespace LanAutoConfig.Common
         public string TimeZoneId { get; set; }
         /// <summary>是否与 NTP 服务器对时。</summary>
         public bool SyncTime { get; set; }
+        /// <summary>
+        /// 要加入的域（仅域名，用于被控端界面预览）。
+        /// 域账号/密码刻意<b>不</b>放进广播包：UDP 广播同网段所有机器都能收到，
+        /// 域凭据只在点【下发执行】时用单播的 MasterExecuteCmd 发出去。
+        /// </summary>
+        public string Domain { get; set; }
 
         public BroadcastTemplateMsg() : base() { }
         public BroadcastTemplateMsg(string sessionId, string ipPrefix, string mask, string gw,
             string dns1, string dns2, string hnPrefix, bool isDhcp,
-            string workgroup = null, string timeZoneId = null, bool syncTime = false)
+            string workgroup = null, string timeZoneId = null, bool syncTime = false,
+            string domain = null)
             : base(MsgTypes.BroadcastTemplate, sessionId)
         {
             IpPrefix = ipPrefix; SubnetMask = mask; Gateway = gw;
             Dns1 = dns1; Dns2 = dns2; HostNamePrefix = hnPrefix; IsDhcp = isDhcp;
             Workgroup = workgroup; TimeZoneId = timeZoneId; SyncTime = syncTime;
+            Domain = domain;
         }
         protected override string StableBody()
-            => $"{IpPrefix}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{HostNamePrefix}|{IsDhcp}|{Workgroup}|{TimeZoneId}|{SyncTime}";
+            => $"{IpPrefix}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{HostNamePrefix}|{IsDhcp}|{Workgroup}|{TimeZoneId}|{SyncTime}|{Domain}";
     }
 
     /// <summary>6.2 SlaveReport：被控端上报预览配置。</summary>
@@ -137,11 +182,19 @@ namespace LanAutoConfig.Common
         public string TimeZoneId { get; set; }
         /// <summary>是否与 NTP 对时。</summary>
         public bool SyncTime { get; set; }
+        /// <summary>要加入的域（空表示不改）。</summary>
+        public string Domain { get; set; }
+        /// <summary>加域账号（域\用户 或 user@domain）。只在这条单播指令里出现。</summary>
+        public string DomainUser { get; set; }
+        /// <summary>加域密码。注意：局域网内为明文传输，请使用“只能把机器加入指定 OU”的专用低权限账号。</summary>
+        public string DomainPassword { get; set; }
+        /// <summary>目标 OU（可空，如 OU=PC,OU=Room1,DC=corp,DC=local）。</summary>
+        public string OuPath { get; set; }
 
         public MasterExecuteCmdMsg() : base() { }
         public MasterExecuteCmdMsg(string sessionId) : base(MsgTypes.MasterExecuteCmd, sessionId) { }
         protected override string StableBody()
-            => $"{LocalMac}|{TargetHostName}|{TargetIp}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{IsDhcp}|{NeedAutoReboot}|{Workgroup}|{TimeZoneId}|{SyncTime}";
+            => $"{LocalMac}|{TargetHostName}|{TargetIp}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{IsDhcp}|{NeedAutoReboot}|{Workgroup}|{TimeZoneId}|{SyncTime}|{Domain}|{DomainUser}|{DomainPassword}|{OuPath}";
     }
 
     /// <summary>6.4 SlaveResultReport：被控端回传执行结果。</summary>
@@ -308,6 +361,106 @@ namespace LanAutoConfig.Common
         protected override string StableBody() => $"{LocalMac}|{CurrentHostName}|{CurrentIp}|{ExpectedHostName}|{ExpectedIp}|{Match}|{Note?.Length ?? 0}";
     }
 
+    /// <summary>
+    /// 6.15 MasterFilePushCmd：控制端让被控端从内置文件服务下载一个文件（安装包/脚本/驱动）。
+    /// 文件走 HTTP（TCP 48890），指令走 TCP 48889：大文件不占指令通道，失败也能单独重试。
+    /// </summary>
+    public class MasterFilePushCmdMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        /// <summary>文件名（只取文件名，不含路径）。</summary>
+        public string FileName { get; set; }
+        /// <summary>下载地址 http://控制端IP:48890/f/随机令牌/文件名。</summary>
+        public string Url { get; set; }
+        /// <summary>文件 SHA256（十六进制小写），下载后校验，防止传输出错或被替换。</summary>
+        public string Sha256 { get; set; }
+        public long SizeBytes { get; set; }
+        /// <summary>保存到被控端的哪个路径（支持 %TEMP% / %ProgramData% 等环境变量；空 = %TEMP%\LanAC\文件名）。</summary>
+        public string TargetPath { get; set; }
+        /// <summary>下载完成后是否执行。</summary>
+        public bool RunAfter { get; set; }
+        /// <summary>执行参数（如 msiexec 的 /qn）。</summary>
+        public string RunArgs { get; set; }
+        /// <summary>执行方式：auto / msi / exe / ps1 / bat / none。</summary>
+        public string RunMode { get; set; }
+        public int TimeoutSeconds { get; set; }
+
+        public MasterFilePushCmdMsg() : base() { }
+        public MasterFilePushCmdMsg(string sessionId) : base(MsgTypes.MasterFilePush, sessionId) { }
+        protected override string StableBody()
+            => $"{LocalMac}|{FileName}|{Url}|{Sha256}|{SizeBytes}|{TargetPath}|{RunAfter}|{RunArgs}|{RunMode}|{TimeoutSeconds}";
+    }
+
+    /// <summary>6.16 SlaveFileResult：文件下发/自升级的结果回传。</summary>
+    public class SlaveFileResultMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        public string FileName { get; set; }
+        public bool Success { get; set; }
+        public string Message { get; set; }
+        public long Bytes { get; set; }
+        public string Sha256 { get; set; }
+
+        public SlaveFileResultMsg() : base() { }
+        public SlaveFileResultMsg(string sessionId) : base(MsgTypes.SlaveFileResult, sessionId) { }
+        protected override string StableBody()
+            => $"{LocalMac}|{FileName}|{Success}|{Message?.Length ?? 0}|{Bytes}|{Sha256}";
+    }
+
+    /// <summary>6.17 MasterSelfUpdateCmd：控制端让被控端用新 exe 替换自己并重启程序（不需要跑现场）。</summary>
+    public class MasterSelfUpdateCmdMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        public string Url { get; set; }
+        public string Sha256 { get; set; }
+        public long SizeBytes { get; set; }
+
+        public MasterSelfUpdateCmdMsg() : base() { }
+        public MasterSelfUpdateCmdMsg(string sessionId) : base(MsgTypes.MasterSelfUpdate, sessionId) { }
+        protected override string StableBody() => $"{LocalMac}|{Url}|{Sha256}|{SizeBytes}";
+    }
+
+    /// <summary>6.18 MasterScreenshotCmd：控制端要求被控端截一张屏（排障用，看卡在哪个界面）。</summary>
+    public class MasterScreenshotCmdMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        /// <summary>最大宽度（像素），超出则等比缩小；0 = 1280。缩小是为了让一张图能塞进一条消息。</summary>
+        public int MaxWidth { get; set; }
+
+        public MasterScreenshotCmdMsg() : base() { }
+        public MasterScreenshotCmdMsg(string sessionId) : base(MsgTypes.MasterScreenshot, sessionId) { }
+        protected override string StableBody() => $"{LocalMac}|{MaxWidth}";
+    }
+
+    /// <summary>6.19 SlaveScreenshotResult：截屏回传（JPEG 的 Base64）。</summary>
+    public class SlaveScreenshotResultMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        public bool Success { get; set; }
+        public string Base64 { get; set; }
+        public int Width { get; set; }
+        public int Height { get; set; }
+        public string Message { get; set; }
+
+        public SlaveScreenshotResultMsg() : base() { }
+        public SlaveScreenshotResultMsg(string sessionId) : base(MsgTypes.SlaveScreenshot, sessionId) { }
+        protected override string StableBody()
+            => $"{LocalMac}|{Success}|{Width}|{Height}|{Base64?.Length ?? 0}|{Message?.Length ?? 0}";
+    }
+
+    /// <summary>6.20 MasterProcCmd：控制端要求被控端程序自己重启（加载新配置）或退出（换成新 exe 前清场）。</summary>
+    public class MasterProcCmdMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        /// <summary>"restart" 或 "exit"。</summary>
+        public string Action { get; set; }
+        public int DelaySeconds { get; set; }
+
+        public MasterProcCmdMsg() : base() { }
+        public MasterProcCmdMsg(string sessionId) : base(MsgTypes.MasterProcCmd, sessionId) { }
+        protected override string StableBody() => $"{LocalMac}|{Action}|{DelaySeconds}";
+    }
+
     /// <summary>JSON 序列化 / 反序列化助手（统一 UTF-8，PascalCase 字段与文档一致）。</summary>
     public static class JsonHelper
     {
@@ -348,6 +501,12 @@ namespace LanAutoConfig.Common
                     MsgTypes.SlaveCustomResult  => JsonSerializer.Deserialize<SlaveCustomResultMsg>(json, Opts),
                     MsgTypes.MasterVerifyCmd    => JsonSerializer.Deserialize<MasterVerifyCmdMsg>(json, Opts),
                     MsgTypes.SlaveVerifyResult  => JsonSerializer.Deserialize<SlaveVerifyResultMsg>(json, Opts),
+                    MsgTypes.MasterFilePush     => JsonSerializer.Deserialize<MasterFilePushCmdMsg>(json, Opts),
+                    MsgTypes.SlaveFileResult    => JsonSerializer.Deserialize<SlaveFileResultMsg>(json, Opts),
+                    MsgTypes.MasterSelfUpdate   => JsonSerializer.Deserialize<MasterSelfUpdateCmdMsg>(json, Opts),
+                    MsgTypes.MasterScreenshot   => JsonSerializer.Deserialize<MasterScreenshotCmdMsg>(json, Opts),
+                    MsgTypes.SlaveScreenshot    => JsonSerializer.Deserialize<SlaveScreenshotResultMsg>(json, Opts),
+                    MsgTypes.MasterProcCmd      => JsonSerializer.Deserialize<MasterProcCmdMsg>(json, Opts),
                     _ => null
                 };
                 return msg;

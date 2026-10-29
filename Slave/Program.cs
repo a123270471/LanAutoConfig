@@ -135,6 +135,18 @@ namespace LanAutoConfig
             return true;
         }
 
+        /// <summary>
+        /// 主动释放单实例锁（“重启程序/自升级”前必须调用）。
+        /// 不释放的话，新进程启动时会看到互斥体已存在，直接判定“已有实例在跑”然后退出 ——
+        /// 表现为“点重启后程序彻底没了”。必须在持有它的线程（主线程/UI 线程）调用。
+        /// </summary>
+        internal static void ReleaseSingleInstance()
+        {
+            try { _singleMutex?.ReleaseMutex(); } catch { }
+            try { _singleMutex?.Dispose(); } catch { }
+            _singleMutex = null;
+        }
+
         private static void AlreadyRunning(TextLogger logger, SlaveOptions options, string mutexName)
         {
             try { logger.Warn($"已有被控端实例在运行（互斥体 {mutexName} 已存在），本次启动直接退出，不再启动第二个"); } catch { }

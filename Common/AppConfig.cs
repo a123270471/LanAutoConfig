@@ -5,14 +5,17 @@ namespace LanAutoConfig
     {
         public const int UdpPort = 48888;          // UDP：广播发现、模板推送
         public const int TcpPort = 48889;          // TCP：可靠传输上报、指令、结果
+        /// <summary>控制端内置文件服务端口（HTTP）：被控端从这里下载安装包/脚本/新 exe。</summary>
+        public const int FileServerPort = 48890;
         /// <summary>
         /// 校验标记，过滤无关 UDP/TCP 包。
-        /// V3 起：SlaveReport 携带硬件信息、新增心跳/重启指令、模板增加工作组/时区，
-        /// 两端必须一起升级；混用时会在 Magic/Check 校验处被明确拒绝并记录日志。
+        /// V4 起：消息基类新增「本机身份令牌」并纳入校验码 —— 只有真正与控制端配对过的终端
+        /// 才能被下发指令（此前任何人只要知道协议格式就能伪造改 IP / 执行脚本 / 重启）。
+        /// 两端必须一起升级；混用时会在 Magic 校验处被明确拒绝，并提示“协议版本不一致”。
         /// </summary>
-        public const string Magic = "LANAC-V3";
+        public const string Magic = "LANAC-V4";
         /// <summary>协议版本号，仅用于日志排查。</summary>
-        public const string ProtocolVersion = "3";
+        public const string ProtocolVersion = "4";
 
         public const int BroadcastIntervalMs = 2500; // 控制端广播一次模板的常规周期
         /// <summary>
@@ -87,6 +90,9 @@ namespace LanAutoConfig
 
         /// <summary>被控端界面偏好（开机自启开关等），与命令行参数分开存。</summary>
         public static string SlavePrefsPath => Path.Combine(DataDir, "slave-prefs.json");
+
+        /// <summary>控制端「文件分发」目录：放在这里的文件才能被下发（避免把整块硬盘暴露成下载站）。</summary>
+        public static string FileShareDir => Path.Combine(DataDir, "files");
 
         /// <summary>判断当前进程是否以管理员权限运行（被控端必须管理员）。</summary>
         public static bool IsAdministrator()

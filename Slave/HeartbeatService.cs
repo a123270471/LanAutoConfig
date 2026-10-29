@@ -16,6 +16,8 @@ namespace LanAutoConfig.Slave
         private string _masterIp, _sessionId, _mac, _hostName, _localIp;
         /// <summary>网卡别名与掩码：用于每条心跳重新算“当前该报哪个本机地址”。</summary>
         private string _adapterAlias, _mask;
+        /// <summary>本机身份令牌（随心跳一起报给控制端，控制端之后每条指令都会带回）。</summary>
+        private string _token;
         private volatile string _state = "idle";
         private volatile bool _running;   // 定时器是否在跑（Stop 后不要再补发）
         private int _failing;          // 连续失败次数，用于避免刷屏
@@ -26,7 +28,7 @@ namespace LanAutoConfig.Slave
 
         /// <summary>设置上报目标（收到新模板时调用）。</summary>
         public void Configure(string masterIp, string sessionId, string mac, string hostName, string localIp,
-            string adapterAlias = null, string mask = null)
+            string adapterAlias = null, string mask = null, string token = null)
         {
             lock (_lock)
             {
@@ -37,6 +39,7 @@ namespace LanAutoConfig.Slave
                 _localIp = localIp;
                 _adapterAlias = adapterAlias;
                 _mask = mask;
+                if (!string.IsNullOrEmpty(token)) _token = token;
             }
         }
 
@@ -106,11 +109,11 @@ namespace LanAutoConfig.Slave
 
         private void DoTick()
         {
-            string ip, sid, mac, host, localIp, alias, mask;
+            string ip, sid, mac, host, localIp, alias, mask, token;
             lock (_lock)
             {
                 ip = _masterIp; sid = _sessionId; mac = _mac; host = _hostName; localIp = _localIp;
-                alias = _adapterAlias; mask = _mask;
+                alias = _adapterAlias; mask = _mask; token = _token;
             }
             if (string.IsNullOrEmpty(ip) || string.IsNullOrEmpty(sid) || string.IsNullOrEmpty(mac)) return;
 
@@ -127,7 +130,8 @@ namespace LanAutoConfig.Slave
                 LocalMac = mac,
                 HostName = host,
                 LocalIp = localIp,
-                State = _state
+                State = _state,
+                Token = token ?? ""
             };
             bool ok = SendLight(ip, AppConfig.TcpPort, msg, out string err);
             LastError = ok ? null : err;

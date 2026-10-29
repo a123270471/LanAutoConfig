@@ -11,3 +11,4 @@ global using System.Net.Sockets;
 global using System.Windows.Forms;
 global using System.Diagnostics;
 global using System.Drawing;
+global using System.Net.Http;

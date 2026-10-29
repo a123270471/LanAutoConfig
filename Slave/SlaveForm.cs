@@ -43,6 +43,8 @@ namespace LanAutoConfig.Slave
         /// <summary>程序内部改勾选状态时用，避免又触发一次安装/删除。</summary>
         private bool _suppressAutostart;
         private readonly SlavePrefs _prefs = SlavePrefs.Load();
+        /// <summary>本机身份令牌：随上报/心跳发给控制端，之后每条指令都要校验它（防伪造）。</summary>
+        private string _token;
         private TextBox _txtLog;
 
         public SlaveForm(SlaveOptions options = null)
@@ -74,7 +76,16 @@ namespace LanAutoConfig.Slave
             _tcp.OnAssignSuffix += c => SafeUi(() => OnAssignSuffixCommand(c));
             _tcp.OnCustomCmd += c => SafeUi(() => OnCustomCommand(c));
             _tcp.OnVerify += c => SafeUi(() => OnVerifyCommand(c));
+            _tcp.OnFilePush += c => SafeUi(() => OnFilePushCommand(c));
+            _tcp.OnSelfUpdate += c => SafeUi(() => OnSelfUpdateCommand(c));
+            _tcp.OnScreenshot += c => SafeUi(() => OnScreenshotCommand(c));
+            _tcp.OnProcCmd += c => SafeUi(() => OnProcCommand(c));
             _hb.Log += m => SafeUi(() => LogLine(m));
+
+            // 身份令牌：本机生成一次后固定，控制端下发指令必须带回同一个值
+            _token = _prefs.EnsureToken();
+            _prefs.Save();
+            _tcp.SetToken(_token);
 
             // 硬件/资产信息后台采集（WMI 偶尔很慢，不能卡住启动）
             HardwareCollector.EnsureStarted();
@@ -162,7 +173,7 @@ namespace LanAutoConfig.Slave
             if (adp == null || string.IsNullOrEmpty(adp.Mac)) return;
             string ip = NetworkHelper.GetIpv4ByAdapter(adp.Alias);
             _hb.Configure(_masterIp, _sessionId, adp.Mac, Environment.MachineName, ip,
-                adp.Alias, _template?.SubnetMask);
+                adp.Alias, _template?.SubnetMask, _token);
             _hb.Start();
         }
 
@@ -328,6 +339,7 @@ namespace LanAutoConfig.Slave
                 log("[拒绝] 尚未收到模板，不知道控制端地址，无法回传");
                 return false;
             }
+            msg.Token = _token;   // 每条回传都带上本机令牌，控制端据此确认“不是别人冒充的”
             string sendIp = ResolveReplySourceIp(adapterAlias);
             bool ok = TcpSend.SendTo(_masterIp, AppConfig.TcpPort, msg, sendIp, out string err);
             if (!ok && !string.IsNullOrEmpty(sendIp))
@@ -493,6 +505,221 @@ namespace LanAutoConfig.Slave
             LogLine($"验收结果：{(match ? "通过" : "不符")}（实际 {curHost}/{curIp}）{(match ? "" : " - " + string.Join("；", notes))}");
         }
 
+        // ---------- 文件下发 / 自升级 / 截屏 / 程序控制 ----------
+
+        /// <summary>
+        /// 控制端下发文件（安装包/脚本/驱动）：下载 → SHA256 校验 → 落盘 →（可选）静默执行 → 回传结果。
+        /// 整个过程放后台：几百 MB 的安装包在 UI 线程下载会把界面锁死。
+        /// </summary>
+        private void OnFilePushCommand(MasterFilePushCmdMsg cmd)
+        {
+            if (!IsForThisMachine(cmd.LocalMac, "文件下发")) return;
+            if (string.IsNullOrEmpty(_masterIp))
+            {
+                LogLine("[拒绝] 文件下发：尚未收到模板/控制端地址，忽略");
+                return;
+            }
+
+            string fileName = Path.GetFileName(cmd.FileName ?? "download.bin");
+            if (string.IsNullOrWhiteSpace(fileName)) fileName = "download.bin";
+            string adapterAlias = (_cmbAdapter?.SelectedItem as NetworkAdapterInfo)?.Alias;
+
+            _lblStatus.Text = cmd.RunAfter ? $"正在下载并安装 {fileName}…" : $"正在下载 {fileName}…";
+            LogLine($"收到文件下发：{fileName}（{(cmd.RunAfter ? "下载后执行" : "仅保存")}，{cmd.SizeBytes / 1024} KB）");
+
+            Task.Run(() =>
+            {
+                var got = FileReceiver.Download(cmd.Url, fileName, cmd.TargetPath, cmd.Sha256, cmd.SizeBytes,
+                    m => SafeUi(() => LogLine(m)));
+
+                bool ok = got.Success;
+                string message = got.Message;
+                bool executed = false;
+                int exitCode = 0;
+
+                if (got.Success && cmd.RunAfter)
+                {
+                    string target = FileReceiver.ResolveTargetPath(cmd.TargetPath, fileName);
+                    var run = FileReceiver.Run(target, cmd.RunMode, cmd.RunArgs, cmd.TimeoutSeconds,
+                        m => SafeUi(() => LogLine(m)));
+                    ok = run.Success;
+                    executed = run.Executed;
+                    exitCode = run.ExitCode;
+                    message = got.Message + "；" + run.Message;
+                }
+
+                var res = new SlaveFileResultMsg(_sessionId)
+                {
+                    LocalMac = cmd.LocalMac,
+                    FileName = fileName,
+                    Success = ok,
+                    Message = Clip(message, 2000),
+                    Bytes = got.Bytes,
+                    Sha256 = got.Sha256
+                };
+                SendToMasterFromBg(res, adapterAlias);
+
+                SafeUi(() =>
+                {
+                    _lblStatus.Text = ok ? $"文件下发完成：{fileName}" : $"文件下发失败：{fileName}";
+                    LogLine($"文件下发结果：{(ok ? "成功" : "失败")}（{(executed ? "已执行，退出码 " + exitCode : "未执行")}）- {message}");
+                });
+            });
+        }
+
+        /// <summary>
+        /// 控制端让本机升级：下载新 exe → 校验 → 交给替换脚本（等本进程退出后覆盖并重启）。
+        /// 这里先把结果回传给控制端，再退出，否则控制端只会看到“离线”不知道升级到哪一步了。
+        /// </summary>
+        private void OnSelfUpdateCommand(MasterSelfUpdateCmdMsg cmd)
+        {
+            if (!IsForThisMachine(cmd.LocalMac, "自升级")) return;
+            if (string.IsNullOrEmpty(_masterIp)) return;
+
+            if (!_options.Silent &&
+                MessageBox.Show($"控制端要求把被控端程序升级到新版本（{cmd.SizeBytes / 1024} KB）。\n\n" +
+                                "下载并校验通过后会自动替换并重启本程序，期间屏幕可能闪一下。现在升级吗？",
+                    "远程升级", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            {
+                LogLine("操作员拒绝了自升级");
+                var no = new SlaveFileResultMsg(_sessionId)
+                {
+                    LocalMac = cmd.LocalMac, FileName = "自升级", Success = false, Message = "操作员在本机拒绝了升级"
+                };
+                SendToMaster(no);
+                return;
+            }
+
+            string adapterAlias = (_cmbAdapter?.SelectedItem as NetworkAdapterInfo)?.Alias;
+            _lblStatus.Text = "正在下载新版本…";
+            LogLine("收到自升级指令，开始下载新版本");
+
+            Task.Run(() =>
+            {
+                string newExe = null;
+                string err = null;
+                try
+                {
+                    newExe = SelfUpdater.DownloadNewVersion(cmd.Url, cmd.Sha256, cmd.SizeBytes,
+                        m => SafeUi(() => LogLine(m)));
+                }
+                catch (Exception ex) { err = ex.Message; }
+
+                if (newExe == null)
+                {
+                    var bad = new SlaveFileResultMsg(_sessionId)
+                    {
+                        LocalMac = cmd.LocalMac, FileName = "自升级", Success = false, Message = Clip("下载/校验失败：" + err, 1000)
+                    };
+                    SendToMasterFromBg(bad, adapterAlias);
+                    SafeUi(() => { _lblStatus.Text = "自升级失败"; LogLine("自升级失败：" + err); });
+                    return;
+                }
+
+                var okMsg = new SlaveFileResultMsg(_sessionId)
+                {
+                    LocalMac = cmd.LocalMac, FileName = "自升级", Success = true,
+                    Message = "新版本已下载并校验通过，正在替换并重启程序"
+                };
+                SendToMasterFromBg(okMsg, adapterAlias);
+
+                SafeUi(() =>
+                {
+                    LogLine("新版本已就位，准备替换并重启本程序…");
+                    try
+                    {
+                        string script = SelfUpdater.LaunchReplaceAndRestart(newExe, BuildRestartArgs());
+                        LogLine("替换脚本已启动：" + script);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogLine("启动替换脚本失败：" + ex.Message);
+                        return;   // 没启动成功就别退出，留在旧版本还能用
+                    }
+                    Program.ReleaseSingleInstance();   // 释放单实例锁，否则新进程会被自己挡住
+                    Application.Exit();
+                });
+            });
+        }
+
+        /// <summary>控制端要求截屏：截当前桌面，压成 JPEG 回传。</summary>
+        private void OnScreenshotCommand(MasterScreenshotCmdMsg cmd)
+        {
+            if (!IsForThisMachine(cmd.LocalMac, "截屏")) return;
+            string adapterAlias = (_cmbAdapter?.SelectedItem as NetworkAdapterInfo)?.Alias;
+            LogLine("收到截屏指令，正在截取当前桌面…");
+
+            Task.Run(() =>
+            {
+                var r = ScreenCapture.Capture(cmd.MaxWidth);
+                var res = new SlaveScreenshotResultMsg(_sessionId)
+                {
+                    LocalMac = cmd.LocalMac,
+                    Success = r.Ok,
+                    Base64 = r.Base64,
+                    Width = r.Width,
+                    Height = r.Height,
+                    Message = r.Error
+                };
+                SendToMasterFromBg(res, adapterAlias);
+                SafeUi(() =>
+                {
+                    if (r.Ok) { _lblStatus.Text = $"已回传截屏（{r.Width}x{r.Height}）"; LogLine($"截屏已回传：{r.Width}x{r.Height}"); }
+                    else { _lblStatus.Text = "截屏失败"; LogLine("截屏失败：" + r.Error); }
+                });
+            });
+        }
+
+        /// <summary>控制端要求“重启本程序”或“退出本程序”（换 exe / 清场用）。</summary>
+        private void OnProcCommand(MasterProcCmdMsg cmd)
+        {
+            if (!IsForThisMachine(cmd.LocalMac, "程序控制")) return;
+            string action = (cmd.Action ?? "").Trim().ToLowerInvariant();
+
+            if (action == "exit")
+            {
+                LogLine("按控制端指令退出被控端程序");
+                Program.ReleaseSingleInstance();
+                Application.Exit();
+                return;
+            }
+
+            LogLine("按控制端指令重启被控端程序…");
+            try
+            {
+                string exe = Application.ExecutablePath;
+                string args = BuildRestartArgs();
+                Program.ReleaseSingleInstance();
+                Process.Start(new ProcessStartInfo(exe, args)
+                {
+                    UseShellExecute = false,
+                    WorkingDirectory = Path.GetDirectoryName(exe) ?? AppContext.BaseDirectory
+                });
+                LogLine("新进程已启动，即将退出当前进程");
+            }
+            catch (Exception ex)
+            {
+                LogLine("重启程序失败：" + ex.Message);
+                return;
+            }
+            Application.Exit();
+        }
+
+        /// <summary>重启自身时沿用原来的命令行参数（--silent / --suffix 等），保持无人值守语义。</summary>
+        private static string BuildRestartArgs()
+        {
+            var args = Environment.GetCommandLineArgs();
+            if (args.Length <= 1) return "";
+            var sb = new StringBuilder();
+            for (int i = 1; i < args.Length; i++)
+            {
+                string a = args[i] ?? "";
+                if (sb.Length > 0) sb.Append(' ');
+                sb.Append(a.IndexOf(' ') >= 0 ? "\"" + a + "\"" : a);
+            }
+            return sb.ToString();
+        }
+
         /// <summary>指令里的目标 MAC 是否是本机（还没上报过时不做限制，与旧行为一致）。</summary>
         private bool IsForThisMachine(string targetMac, string what)
         {
@@ -505,7 +732,6 @@ namespace LanAutoConfig.Slave
             }
             return true;
         }
-
         /// <summary>比较两份模板内容是否一致（忽略重复广播）。</summary>
         private static bool TemplateEquals(TemplateModel a, TemplateModel b)
             => string.Equals(a.IpPrefix, b.IpPrefix, StringComparison.Ordinal)
@@ -517,7 +743,8 @@ namespace LanAutoConfig.Slave
             && a.IsDhcp == b.IsDhcp
             && string.Equals(a.Workgroup, b.Workgroup, StringComparison.Ordinal)
             && string.Equals(a.TimeZoneId, b.TimeZoneId, StringComparison.Ordinal)
-            && a.SyncTime == b.SyncTime;
+            && a.SyncTime == b.SyncTime
+            && string.Equals(a.Domain, b.Domain, StringComparison.Ordinal);
 
         private void OnReset()
         {
@@ -655,7 +882,8 @@ namespace LanAutoConfig.Slave
                 Dns1 = _template.Dns1,
                 Dns2 = _template.Dns2,
                 IsDhcp = _template.IsDhcp,
-                Hardware = HardwareCollector.Current
+                Hardware = HardwareCollector.Current,
+                Token = _token
             };
             LogLine($"上报目标 {_masterIp}:{AppConfig.TcpPort}，源地址 {sendIp}，网卡 [{adp.Alias}]");
             bool ok = TcpSend.SendTo(_masterIp, AppConfig.TcpPort, msg, sendIp, out string sendErr);
@@ -759,13 +987,19 @@ namespace LanAutoConfig.Slave
                 }
                 else
                 {
-                    PsResult r1 = null, r2 = null;
+                    PsResult r1 = null, r2 = null, r3 = null;
                     await Task.Run(() =>
                     {
                         r1 = cmd.IsDhcp
                             ? _changer.SetDhcp(ifAlias)
                             : _changer.SetStaticIp(ifAlias, cmd.TargetIp, cmd.SubnetMask, cmd.Gateway, cmd.Dns1, cmd.Dns2);
                         r2 = _changer.RenameComputer(cmd.TargetHostName);
+                        // 加域必须放在改名之后：域里是按新主机名建计算机对象的。
+                        // 域凭据只在单播的执行指令里，不随 UDP 广播下发。
+                        if (!string.IsNullOrWhiteSpace(cmd.Domain))
+                            r3 = _changer.JoinDomain(cmd.Domain, cmd.DomainUser, cmd.DomainPassword, cmd.OuPath);
+                        else if (!string.IsNullOrWhiteSpace(cmd.Workgroup))
+                            r3 = _changer.SetWorkgroup(cmd.Workgroup);
                     });
 
                     if (r1 == null || r2 == null) { success = false; sb.AppendLine("内部错误：执行结果为空"); }
@@ -776,6 +1010,13 @@ namespace LanAutoConfig.Slave
 
                         if (r2.Success) sb.AppendLine("重命名成功（重启后完全生效）");
                         else { success = false; sb.AppendLine("重命名失败：" + r2.Error); }
+
+                        if (r3 != null)
+                        {
+                            string what = string.IsNullOrWhiteSpace(cmd.Domain) ? "加入工作组" : $"加入域 {cmd.Domain}";
+                            if (r3.Success) sb.AppendLine(what + "成功（重启后生效）");
+                            else { success = false; sb.AppendLine(what + "失败：" + r3.Error); }
+                        }
 
                         // PowerShell 的警告/输出一并写到本地日志，便于排查
                         if (!string.IsNullOrEmpty(r1.Output)) sb.AppendLine("PS 输出：" + r1.Output);

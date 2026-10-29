@@ -118,6 +118,16 @@ namespace LanAutoConfig.Common
         /// <summary>失败归类对应的修复建议。</summary>
         public string FailSuggestion { get; set; }
 
+        /// <summary>
+        /// 该终端的身份令牌（第一次收到它的上报/心跳时记下来，之后每条指令都带回）。
+        /// 被控端收到指令会校验“令牌是否为本机令牌”，不符直接丢弃 —— 见 NetMessage.Token。
+        /// </summary>
+        public string AuthToken { get; set; }
+        /// <summary>最近一次连通性探测结果（“12ms”/“不通”），仅界面展示用。</summary>
+        public string ProbeText { get; set; }
+        /// <summary>最近一次 IP 冲突扫描结论（如“该 IP 已被 00-11-22-33-44-55 占用”）。</summary>
+        public string IpConflictNote { get; set; }
+
         /// <summary>从被控端上报消息填充（保留已存在项的状态与错误，状态由 SessionManager 决定）。</summary>
         public void ApplyReport(SlaveReportMsg m)
         {
@@ -133,6 +143,9 @@ namespace LanAutoConfig.Common
             Dns2 = m.Dns2;
             IsDhcp = m.IsDhcp;
             if (m.Hardware != null) Hardware = m.Hardware;
+            // 上报里带着该终端的身份令牌：记下来，之后每条指令都原样带回，
+            // 被控端据此确认“这条指令确实来自和它对过话的控制端”。
+            if (!string.IsNullOrEmpty(m.Token)) AuthToken = m.Token;
             LastSeen = DateTime.Now;
         }
     }
@@ -153,12 +166,21 @@ namespace LanAutoConfig.Common
         public string TimeZoneId { get; set; }
         /// <summary>是否与 NTP 服务器对时。</summary>
         public bool SyncTime { get; set; }
+        /// <summary>要加入的域（空表示不改）。域凭据不在模板里，只在下发执行时单播发出。</summary>
+        public string Domain { get; set; }
+        /// <summary>加域账号（仅控制端本地使用，不随广播下发）。</summary>
+        public string DomainUser { get; set; }
+        /// <summary>加域密码（仅控制端本地使用，不随广播下发）。</summary>
+        public string DomainPassword { get; set; }
+        /// <summary>目标 OU（可空）。</summary>
+        public string OuPath { get; set; }
 
         public static TemplateModel From(BroadcastTemplateMsg m) => new TemplateModel
         {
             IpPrefix = m.IpPrefix, SubnetMask = m.SubnetMask, Gateway = m.Gateway,
             Dns1 = m.Dns1, Dns2 = m.Dns2, HostNamePrefix = m.HostNamePrefix, IsDhcp = m.IsDhcp,
-            Workgroup = m.Workgroup, TimeZoneId = m.TimeZoneId, SyncTime = m.SyncTime
+            Workgroup = m.Workgroup, TimeZoneId = m.TimeZoneId, SyncTime = m.SyncTime,
+            Domain = m.Domain
         };
     }
 

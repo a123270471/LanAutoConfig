@@ -10,6 +10,8 @@ namespace LanAutoConfig.Slave
         private volatile string _currentSessionId = "";
         /// <summary>只接受来自该 IP 的指令（控制端广播网卡地址）；为空时不做来源限制。</summary>
         private volatile string _allowedMasterIp;
+        /// <summary>本机身份令牌：指令里带来的令牌必须与它一致，否则丢弃（防止同网段伪造指令）。</summary>
+        private volatile string _token;
 
         /// <summary>收到执行指令（仅当会话 ID 与当前一致时触发）。</summary>
         public event Action<MasterExecuteCmdMsg> OnExecute;
@@ -27,9 +29,20 @@ namespace LanAutoConfig.Slave
         public event Action<MasterCustomCmdMsg> OnCustomCmd;
         /// <summary>收到“验收”指令：要求被控端上报当前实际配置。</summary>
         public event Action<MasterVerifyCmdMsg> OnVerify;
+        /// <summary>收到“文件下发”指令（安装包/脚本）。</summary>
+        public event Action<MasterFilePushCmdMsg> OnFilePush;
+        /// <summary>收到“自升级”指令（用新 exe 替换自己）。</summary>
+        public event Action<MasterSelfUpdateCmdMsg> OnSelfUpdate;
+        /// <summary>收到“截屏”指令。</summary>
+        public event Action<MasterScreenshotCmdMsg> OnScreenshot;
+        /// <summary>收到“程序重启/退出”指令。</summary>
+        public event Action<MasterProcCmdMsg> OnProcCmd;
         public event Action<string> Log;
 
         public void SetSessionId(string sid) => _currentSessionId = sid ?? "";
+
+        /// <summary>设置本机令牌（启动时从本地偏好读出，之后不变）。</summary>
+        public void SetToken(string token) => _token = token ?? "";
 
         /// <summary>设置允许下发指令的控制端 IP（收到模板时由窗体写入）。</summary>
         public void SetAllowedMaster(string ip)
@@ -99,9 +112,19 @@ namespace LanAutoConfig.Slave
                         Log?.Invoke($"[丢弃] 来自 {remoteIp} 的消息无法解析（JSON/MsgType 非法）");
                         return;
                     }
-                    if (!msg.Validate())
+                    if (!msg.ValidateEx(out string why))
                     {
-                        Log?.Invoke($"[丢弃] 来自 {remoteIp} 的 {msg.MsgType} 校验失败（Magic/Check 不匹配）");
+                        Log?.Invoke($"[丢弃] 来自 {remoteIp} 的 {msg.MsgType} 校验失败：{why}");
+                        return;
+                    }
+
+                    // 身份令牌：控制端必须把“本机上报时带过去的令牌”原样带回。
+                    // 同网段的其它机器即使知道协议格式、也能收到 UDP 广播，但不知道这台的令牌，
+                    // 因此伪造不了“改 IP / 执行脚本 / 重启”这类指令。
+                    string mine = _token;
+                    if (!string.IsNullOrEmpty(mine) && !string.Equals(msg.Token, mine, StringComparison.Ordinal))
+                    {
+                        Log?.Invoke($"[拒绝] 来自 {remoteIp} 的 {msg.MsgType} 令牌不符（疑似伪造指令），已丢弃");
                         return;
                     }
 
@@ -160,6 +183,26 @@ namespace LanAutoConfig.Slave
                     {
                         Log?.Invoke($"收到控制端验收指令：期望 {vc.ExpectedHostName}/{vc.ExpectedIp} MAC={vc.LocalMac}");
                         OnVerify?.Invoke(vc);
+                    }
+                    else if (msg is MasterFilePushCmdMsg fp && fp.SessionId == sid)
+                    {
+                        Log?.Invoke($"收到控制端文件下发：{fp.FileName}（{(fp.RunAfter ? "下载后执行" : "仅保存")}，{fp.SizeBytes / 1024} KB）MAC={fp.LocalMac}");
+                        OnFilePush?.Invoke(fp);
+                    }
+                    else if (msg is MasterSelfUpdateCmdMsg su && su.SessionId == sid)
+                    {
+                        Log?.Invoke($"收到控制端自升级指令（{su.SizeBytes / 1024} KB）MAC={su.LocalMac}");
+                        OnSelfUpdate?.Invoke(su);
+                    }
+                    else if (msg is MasterScreenshotCmdMsg sc && sc.SessionId == sid)
+                    {
+                        Log?.Invoke($"收到控制端截屏指令 MAC={sc.LocalMac}");
+                        OnScreenshot?.Invoke(sc);
+                    }
+                    else if (msg is MasterProcCmdMsg pc && pc.SessionId == sid)
+                    {
+                        Log?.Invoke($"收到控制端程序指令：{pc.Action} MAC={pc.LocalMac}");
+                        OnProcCmd?.Invoke(pc);
                     }
                     else
                     {

@@ -359,6 +359,47 @@ if (Get-NetIPAddress -InterfaceAlias $if -IPAddress $ip -ErrorAction SilentlyCon
             }
         }
 
+        /// <summary>
+        /// 加入域（Add-Computer）。要求：主机名先改好（域里按新名建对象）、且本机能解析到域控。
+        ///
+        /// 说明：域密码由控制端单播下发，局域网内是明文传输。
+        /// 现场请使用「只能把计算机加入指定 OU」的专用低权限账号，不要用域管理员账号。
+        /// </summary>
+        public PsResult JoinDomain(string domain, string user, string password, string ouPath)
+        {
+            string d = (domain ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(d)) return new PsResult { Success = true, Output = "未配置加入域，跳过" };
+            string u = (user ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(u)) return Fail("配置了加入域，但没有填域账号");
+
+            string ouLine = string.IsNullOrWhiteSpace(ouPath)
+                ? ""
+                : $"$p['OUPath']='{EscapePs(ouPath.Trim())}'\n";
+
+            string script = $@"
+$ErrorActionPreference='Stop'
+$sec = ConvertTo-SecureString '{EscapePs(password ?? "")}' -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential('{EscapePs(u)}', $sec)
+$p = @{{ DomainName='{EscapePs(d)}'; Credential=$cred; Force=$true; Restart=$false }}
+{ouLine}Add-Computer @p
+Write-Output ('已加入域 ' + '{EscapePs(d)}')
+";
+            return RunPs(script, 180000);
+        }
+
+        /// <summary>加入工作组（空字符串表示不改）。</summary>
+        public PsResult SetWorkgroup(string workgroup)
+        {
+            string w = (workgroup ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(w)) return new PsResult { Success = true, Output = "未配置工作组，跳过" };
+            string script = $@"
+$ErrorActionPreference='Stop'
+Add-Computer -WorkgroupName '{EscapePs(w)}' -Force
+Write-Output ('已加入工作组 ' + '{EscapePs(w)}')
+";
+            return RunPs(script, 120000);
+        }
+
         /// <summary>转义 PowerShell 单引号字符串内文本。</summary>
         private static string EscapePs(string s) => (s ?? "").Replace("'", "''");
     }

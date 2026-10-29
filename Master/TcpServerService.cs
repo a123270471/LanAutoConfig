@@ -19,6 +19,15 @@ namespace LanAutoConfig.Master
         public event Action<SlaveCustomResultMsg> OnCustomResult;
         /// <summary>收到被控端验收（当前实际配置）回传。</summary>
         public event Action<SlaveVerifyResultMsg> OnVerifyResult;
+        /// <summary>收到文件下发/自升级的执行结果。</summary>
+        public event Action<SlaveFileResultMsg> OnFileResult;
+        /// <summary>收到截屏回传。</summary>
+        public event Action<SlaveScreenshotResultMsg> OnScreenshot;
+        /// <summary>
+        /// 按 MAC 查“该终端的身份令牌”。返回空表示还没记录过（首次上报/心跳，放行并稍后登记）。
+        /// 由主窗体接到 SessionManager 上。
+        /// </summary>
+        public Func<string, string> TokenResolver;
         public event Action<string> Log;
 
         public bool Start()
@@ -89,10 +98,23 @@ namespace LanAutoConfig.Master
                         Log?.Invoke($"[丢弃] 来自 {remoteIp} 的消息无法解析（JSON/MsgType 非法）");
                         return;
                     }
-                    if (!msg.Validate())
+                    if (!msg.ValidateEx(out string why))
                     {
-                        Log?.Invoke($"[丢弃] 来自 {remoteIp} 的 {msg.MsgType} 校验失败（Magic/Check 不匹配）");
+                        Log?.Invoke($"[丢弃] 来自 {remoteIp} 的 {msg.MsgType} 校验失败：{why}");
                         return;
+                    }
+
+                    // 身份令牌校验：该终端登记过的令牌必须与消息里的一致。
+                    // 没登记过（首次上报/心跳）就放行，由业务处理负责登记。
+                    string macOfMsg = MacOf(msg);
+                    if (!string.IsNullOrEmpty(macOfMsg) && TokenResolver != null)
+                    {
+                        string expect = TokenResolver(macOfMsg);
+                        if (!string.IsNullOrEmpty(expect) && !string.Equals(msg.Token, expect, StringComparison.Ordinal))
+                        {
+                            Log?.Invoke($"[拒绝] 来自 {remoteIp} 的 {msg.MsgType} 令牌不符（MAC={macOfMsg}，疑似伪造），已丢弃");
+                            return;
+                        }
                     }
                     // 把“这条 TCP 连接的真实来源地址”附着到消息上：这是唯一确定可达的地址，
                     // 控制端回发指令时以它为准（心跳/上报自带的 LocalIp 可能已过期）。
@@ -122,6 +144,16 @@ namespace LanAutoConfig.Master
                         Log?.Invoke($"收到验收结果：{remoteIp} MAC={vr.LocalMac} 匹配={vr.Match} 实际={vr.CurrentHostName}/{vr.CurrentIp}");
                         OnVerifyResult?.Invoke(vr);
                     }
+                    else if (msg is SlaveFileResultMsg fr)
+                    {
+                        Log?.Invoke($"收到文件结果：{remoteIp} MAC={fr.LocalMac} {fr.FileName} 成功={fr.Success}");
+                        OnFileResult?.Invoke(fr);
+                    }
+                    else if (msg is SlaveScreenshotResultMsg sr)
+                    {
+                        Log?.Invoke($"收到截屏：{remoteIp} MAC={sr.LocalMac} 成功={sr.Success} {sr.Width}x{sr.Height}");
+                        OnScreenshot?.Invoke(sr);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -129,6 +161,19 @@ namespace LanAutoConfig.Master
                 }
             }
         }
+
+        /// <summary>取消息里的终端 MAC（所有回传类消息都带 LocalMac）。</summary>
+        private static string MacOf(NetMessage m) => m switch
+        {
+            SlaveReportMsg x => x.LocalMac,
+            SlaveHeartbeatMsg x => x.LocalMac,
+            SlaveResultReportMsg x => x.LocalMac,
+            SlaveCustomResultMsg x => x.LocalMac,
+            SlaveVerifyResultMsg x => x.LocalMac,
+            SlaveFileResultMsg x => x.LocalMac,
+            SlaveScreenshotResultMsg x => x.LocalMac,
+            _ => null
+        };
 
         public void Dispose() => Stop();
     }

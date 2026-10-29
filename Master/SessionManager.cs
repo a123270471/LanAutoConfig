@@ -143,6 +143,8 @@ namespace LanAutoConfig.Master
                     added = true;
                 }
                 it.LastSeen = DateTime.Now;
+                // 心跳同样带令牌：老配置恢复出来的记录（没有令牌）靠这一条补上
+                if (!string.IsNullOrEmpty(hb.Token)) it.AuthToken = hb.Token;
                 // 心跳包里的 LocalIp 是发送方在“收模板那一刻”算的，加临时地址/改 IP 后不会更新，
                 // 用它覆盖 SourceIp 会让控制端把指令发到一个已失效的地址（实测：上报来自 .9，下发却打 .5）。
                 // 因此优先用 TCP 连接的实测来源地址；没有实测值时，仅在本机还没记录过地址时兜底采用。

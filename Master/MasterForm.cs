@@ -30,6 +30,10 @@ namespace LanAutoConfig.Master
         private Label _lblBlacklist, _lblDhcpPool;
         private CheckBox _chkDhcp, _chkDhcpServer;
         private Button _btnStart, _btnStop, _btnReset, _btnManageBlacklist, _btnWhitelist;
+        /// <summary>加域 / 工作组设置入口（按钮文字会显示当前设置摘要）。</summary>
+        private Button _btnDomainJoin;
+        /// <summary>一键装机入口（跑起来后按钮文字会显示当前阶段）。</summary>
+        private Button _btnProvision;
         private Label _lblSession;
         private ComboBox _cmbAdapter;
 
@@ -63,6 +67,27 @@ namespace LanAutoConfig.Master
         /// <summary>分批重启待发送队列（由 _staggerTimer 逐批取出）。</summary>
         private Queue<SlaveSessionItem> _rebootQueue;
         private int _rebootBatchSize;
+
+        // ---- 本轮新增：文件分发 / 截图 / 流水线 / 加域 / 列显示 ----
+        /// <summary>控制端内置文件服务（被控端从这里下载安装包/新 exe）。</summary>
+        private readonly HttpFileServer _http = new HttpFileServer();
+        /// <summary>文件分发结果 / 截屏回传的订阅者（对应对话框）。</summary>
+        private event Action<SlaveFileResultMsg> _fileResultHandlers;
+        private event Action<SlaveScreenshotResultMsg> _screenshotHandlers;
+        /// <summary>加域参数（域凭据只在本机内存/配置里，不随 UDP 广播下发）。</summary>
+        private string _domain, _domainUser, _domainPassword, _ouPath, _workgroup;
+        /// <summary>列表里被隐藏的列名（右键表头可切换，随配置保存）。</summary>
+        private readonly HashSet<string> _hiddenColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// 一键装机流水线。放在主窗体而不是对话框里 —— 一轮流水线可能跑十几分钟，
+        /// 关掉对话框不能把它掐掉，否则关窗就“装到一半没人管了”。
+        /// </summary>
+        private readonly ProvisionJob _provision;
+        /// <summary>流水线驱动：每秒推进一次状态机（时间由 Tick 注入，便于单测）。</summary>
+        private readonly System.Windows.Forms.Timer _provisionTimer = new System.Windows.Forms.Timer();
+        /// <summary>流水线日志/完成事件的订阅者（装机对话框）。</summary>
+        private event Action<string> _provisionLogHandlers;
+        private event Action<ProvisionSummary> _provisionFinishedHandlers;
 
         private volatile bool _broadcasting;
         private volatile bool _dispatching;
@@ -109,6 +134,16 @@ namespace LanAutoConfig.Master
             _server.OnHeartbeat += r => SafeUi(() => OnHeartbeat(r));
             _server.OnCustomResult += r => SafeUi(() => OnCustomResult(r));
             _server.OnVerifyResult += r => SafeUi(() => OnVerifyResult(r));
+            _server.OnFileResult += r => SafeUi(() => OnFileResult(r));
+            _server.OnScreenshot += r => SafeUi(() => OnScreenshot(r));
+            // 令牌校验：每条上报/心跳都带“本机令牌”，用列表里登记的期望值比对
+            _server.TokenResolver = mac => _session.GetByMac(mac)?.AuthToken;
+            _http.Log += m => SafeUi(() => LogLine(m));
+
+            // 一键装机流水线：状态机在 Common，发送动作回到这里
+            _provision = new ProvisionJob(() => SnapshotItems(), new MasterProvisionOps(this));
+            _provisionTimer.Interval = 1000;
+            _provisionTimer.Tick += (s, e) => TickProvision();
 
             // 单独的心跳刷新定时器：只重画“在线”列与状态栏，不整表刷新（否则每 10 秒闪一次、还打断编辑）
             _onlineTimer.Interval = 5000;
@@ -130,9 +165,12 @@ namespace LanAutoConfig.Master
                 try { _onlineTimer.Stop(); } catch { }
                 try { _saveTimer.Stop(); } catch { }
                 try { _staggerTimer.Stop(); } catch { }
+                try { _provisionTimer.Stop(); } catch { }
+                try { _provision?.Abort("控制端退出"); } catch { }
                 SaveSettings();   // 退出前把模板参数与终端列表记下来
                 _broadcast.Stop();
                 _server.Stop();
+                _http.Stop();
                 _dhcp.Stop();
             };
         }
@@ -256,6 +294,30 @@ namespace LanAutoConfig.Master
         internal void RegisterCustomResultHandler(Action<SlaveCustomResultMsg> h) => _customResultHandlers += h;
         internal void UnregisterCustomResultHandler(Action<SlaveCustomResultMsg> h) => _customResultHandlers -= h;
 
+        /// <summary>文件下发 / 自升级的结果回传。</summary>
+        private void OnFileResult(SlaveFileResultMsg m)
+        {
+            var it = _session.GetByMac(m.LocalMac);
+            string name = it?.TargetHostName ?? m.LocalMac;
+            LogLine($"[文件] {name}（{m.LocalMac}）{m.FileName}：{(m.Success ? "成功" : "失败")} - {m.Message}");
+            _fileResultHandlers?.Invoke(m);
+        }
+
+        /// <summary>远程截图回传。</summary>
+        private void OnScreenshot(SlaveScreenshotResultMsg m)
+        {
+            var it = _session.GetByMac(m.LocalMac);
+            string name = it?.TargetHostName ?? m.LocalMac;
+            if (m.Success) LogLine($"[截屏] {name} 已回传 {m.Width}x{m.Height}");
+            else LogLine($"[截屏] {name} 失败：{m.Message}");
+            _screenshotHandlers?.Invoke(m);
+        }
+
+        internal void RegisterFileResultHandler(Action<SlaveFileResultMsg> h) => _fileResultHandlers += h;
+        internal void UnregisterFileResultHandler(Action<SlaveFileResultMsg> h) => _fileResultHandlers -= h;
+        internal void RegisterScreenshotHandler(Action<SlaveScreenshotResultMsg> h) => _screenshotHandlers += h;
+        internal void UnregisterScreenshotHandler(Action<SlaveScreenshotResultMsg> h) => _screenshotHandlers -= h;
+
         /// <summary>当前选中的终端；未选中则取所有在线终端（用于“对全部在线下发”）。</summary>
         internal List<SlaveSessionItem> SelectedItemsOrAllOnline()
         {
@@ -264,14 +326,35 @@ namespace LanAutoConfig.Master
             return _session.Items.Where(x => x.Online).ToList();
         }
 
+        // ---------- 统一下发入口 ----------
+
+        /// <summary>
+        /// 把指令发给某一台终端：自动带上该终端的身份令牌、用广播网卡作源地址。
+        /// 所有“单台下发”都走这里 —— 避免哪个分支漏带令牌，被被控端当成伪造指令直接丢弃。
+        /// </summary>
+        private bool SendToItem(SlaveSessionItem it, NetMessage msg, out string error)
+        {
+            error = null;
+            if (it == null) { error = "终端为空"; return false; }
+            string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
+            if (string.IsNullOrEmpty(target)) { error = "没有可用地址（既无来源 IP 也无目标 IP）"; return false; }
+            if (string.IsNullOrEmpty(it.AuthToken))
+            {
+                // 旧配置恢复出来的记录、或刚升级还没收到心跳：令牌未知，发过去也会被丢弃
+                error = "尚未取得该终端的令牌（等它下一次心跳，约 10 秒内自动获取）";
+                return false;
+            }
+            msg.Token = it.AuthToken;
+            return TcpSend.SendTo(target, AppConfig.TcpPort, msg,
+                SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4(), out error);
+        }
+
         /// <summary>向单台终端下发自定义命令/脚本。</summary>
         internal void SendCustomCommandTo(SlaveSessionItem it, string shell, string script, int timeout)
         {
             var sid = _session.SessionId;
-            var bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
             var cmd = new MasterCustomCmdMsg(sid) { LocalMac = it.Mac, Shell = shell, Script = script, TimeoutSeconds = timeout };
-            string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
-            if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err))
+            if (SendToItem(it, cmd, out string err))
                 LogLine($"已下发自定义命令到 {it.TargetHostName ?? it.Mac}（{it.Mac}）");
             else
                 LogLine($"下发自定义命令失败：{it.Mac} - {err}");
@@ -281,15 +364,13 @@ namespace LanAutoConfig.Master
         internal bool SendVerifyTo(SlaveSessionItem it)
         {
             var sid = _session.SessionId;
-            var bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
             var cmd = new MasterVerifyCmdMsg(sid)
             {
                 LocalMac = it.Mac,
                 ExpectedHostName = it.TargetHostName ?? "",
                 ExpectedIp = it.TargetIp ?? ""
             };
-            string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
-            if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err))
+            if (SendToItem(it, cmd, out string err))
             {
                 LogLine($"已下发验收指令：{it.TargetHostName ?? it.Mac}（期望 {it.TargetHostName}/{it.TargetIp}）");
                 return true;
@@ -332,6 +413,144 @@ namespace LanAutoConfig.Master
                 if (done != null) SafeUi(() => done(ok, fail));
             });
         }
+
+        // ---------- 文件分发 / 远程截图 / 程序控制 / 影响预览 ----------
+
+        /// <summary>确保内置文件服务在跑，返回被控端该用的本机 IP。</summary>
+        private string EnsureFileServer(out string error)
+        {
+            error = null;
+            string ip = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
+            if (string.IsNullOrEmpty(ip)) { error = "没有可用的本机 IPv4 地址"; return null; }
+            if (_http.Running) return ip;
+
+            string token = Guid.NewGuid().ToString("N").Substring(0, 12);
+            if (!_http.Start(AppConfig.FileShareDir, AppConfig.FileServerPort, token))
+            {
+                error = $"文件服务启动失败（TCP {AppConfig.FileServerPort} 可能被占用或被防火墙拦截）";
+                return null;
+            }
+            return ip;
+        }
+
+        /// <summary>
+        /// 把本地文件放进“分发目录”并算好校验值，返回给被控端下载用的地址。
+        /// 只允许分发目录里的文件被下载，所以先复制进去（同一目录则直接用）。
+        /// </summary>
+        internal bool StageFileForPush(string localPath, out string fileName, out string url,
+            out string sha256, out long size, out string error)
+        {
+            fileName = url = sha256 = null; size = 0; error = null;
+            try
+            {
+                if (!File.Exists(localPath)) { error = "文件不存在：" + localPath; return false; }
+                string ip = EnsureFileServer(out error);
+                if (ip == null) return false;
+
+                Directory.CreateDirectory(AppConfig.FileShareDir);
+                fileName = Path.GetFileName(localPath);
+                string dest = Path.Combine(AppConfig.FileShareDir, fileName);
+                if (!string.Equals(Path.GetFullPath(localPath), Path.GetFullPath(dest), StringComparison.OrdinalIgnoreCase))
+                    File.Copy(localPath, dest, overwrite: true);
+
+                size = new FileInfo(dest).Length;
+                sha256 = ComputeFileSha256(dest);
+                url = _http.BuildUrl(ip, fileName);
+                LogLine($"文件已就绪：{fileName}（{size / 1024} KB，SHA256 {ShortHash(sha256)}）");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = "准备文件失败：" + ex.Message;
+                return false;
+            }
+        }
+
+        /// <summary>向单台终端下发文件（下载 + 可选执行）。</summary>
+        internal bool PushFileTo(SlaveSessionItem it, string fileName, string url, string sha256, long size,
+            string targetPath, bool runAfter, string runMode, string runArgs, int timeoutSec, out string error)
+        {
+            var cmd = new MasterFilePushCmdMsg(_session.SessionId)
+            {
+                LocalMac = it.Mac,
+                FileName = fileName,
+                Url = url,
+                Sha256 = sha256,
+                SizeBytes = size,
+                TargetPath = targetPath,
+                RunAfter = runAfter,
+                RunMode = runMode,
+                RunArgs = runArgs,
+                TimeoutSeconds = timeoutSec
+            };
+            return SendToItem(it, cmd, out error);
+        }
+
+        /// <summary>向单台终端下发“用新 exe 替换自己”（自升级）。</summary>
+        internal bool PushSelfUpdateTo(SlaveSessionItem it, string url, string sha256, long size, out string error)
+        {
+            var cmd = new MasterSelfUpdateCmdMsg(_session.SessionId)
+            {
+                LocalMac = it.Mac,
+                Url = url,
+                Sha256 = sha256,
+                SizeBytes = size
+            };
+            return SendToItem(it, cmd, out error);
+        }
+
+        /// <summary>要求单台终端截屏。</summary>
+        internal bool RequestScreenshot(SlaveSessionItem it, int maxWidth, out string error)
+        {
+            var cmd = new MasterScreenshotCmdMsg(_session.SessionId) { LocalMac = it.Mac, MaxWidth = maxWidth };
+            return SendToItem(it, cmd, out error);
+        }
+
+        /// <summary>批量下发“重启/退出被控端程序”。</summary>
+        internal void SendProcCmd(IReadOnlyList<SlaveSessionItem> items, string action)
+        {
+            if (items == null || items.Count == 0) return;
+            string what = action == "exit" ? "退出" : "重启";
+            SendBatchBackground(items, it =>
+            {
+                var cmd = new MasterProcCmdMsg(_session.SessionId) { LocalMac = it.Mac, Action = action };
+                if (SendToItem(it, cmd, out string err)) return true;
+                LogLine($"[程序] {it.TargetHostName}（{it.Mac}）{what}指令下发失败：{err}");
+                return false;
+            }, (ok, fail) => LogLine($"被控端{what}：成功下发 {ok} 台，失败 {fail} 台"));
+        }
+
+        /// <summary>流水线用：批量重启（后台发送，不阻塞）。</summary>
+        internal void RebootItems(IReadOnlyList<SlaveSessionItem> items, int delaySeconds)
+            => SendBatchBackground(items, it => SendRebootTo(it, delaySeconds),
+                (ok, fail) => LogLine($"[流水线] 重启已下发 {ok} 台（失败 {fail}）"));
+
+        /// <summary>流水线用：批量验收。</summary>
+        internal void VerifyItems(IReadOnlyList<SlaveSessionItem> items)
+            => SendBatchBackground(items, SendVerifyTo,
+                (ok, fail) => LogLine($"[流水线] 验收已下发 {ok} 台（失败 {fail}）"));
+
+        /// <summary>流水线用：当前终端列表快照。</summary>
+        internal IReadOnlyList<SlaveSessionItem> SnapshotItems() => _session.Items.ToList();
+
+        /// <summary>下发/重启/关机前的“影响预览”：列出会动哪些机器、有没有离线/冲突/跳过。</summary>
+        private bool ConfirmImpact(string op, string desc, IReadOnlyList<SlaveSessionItem> items, string extra = null)
+        {
+            using var dlg = new ImpactPreviewForm(op, desc, items, extra);
+            return dlg.ShowDialog(this) == DialogResult.OK;
+        }
+
+        private static string ComputeFileSha256(string path)
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024);
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            var sb = new StringBuilder(64);
+            foreach (byte b in sha.ComputeHash(fs)) sb.Append(b.ToString("x2"));
+            return sb.ToString();
+        }
+
+        private static string ShortHash(string sha)
+            => string.IsNullOrEmpty(sha) ? "-" : sha.Substring(0, Math.Min(16, sha.Length)) + "…";
 
         // ---------- 终端列表辅助 ----------
         /// <summary>只刷某台终端的「在线」单元格（收到心跳时立即调用）。</summary>
@@ -522,17 +741,18 @@ namespace LanAutoConfig.Master
             try
             {
                 string oldSession = _session.SessionId;
-                string bindIp = _broadcastIp;
-                // 通知在线终端（尽力而为）——放到后台线程，避免 UI 线程被 5s×N 的超时卡死
-                var targets = _session.Items.Where(x => !string.IsNullOrEmpty(x.SourceIp))
-                                            .Select(x => x.SourceIp).Distinct().ToList();
+                // 通知在线终端（尽力而为）——放到后台线程，避免 UI 线程被 5s×N 的超时卡死。
+                // 用快照：随后 _session.NewSession() 会清空列表。
+                var targets = _session.Items
+                    .Where(x => !string.IsNullOrEmpty(x.SourceIp) || !string.IsNullOrEmpty(x.TargetIp))
+                    .ToList();
                 if (targets.Count > 0)
                 {
                     LogLine($"正在通知 {targets.Count} 台终端清空本地状态…");
                     await Task.Run(() =>
                     {
-                        foreach (var ip in targets)
-                            TcpSend.SendTo(ip, AppConfig.TcpPort, new MasterResetSessionMsg(oldSession), bindIp);
+                        foreach (var it in targets)
+                            SendToItem(it, new MasterResetSessionMsg(oldSession), out _);
                     });
                 }
 
@@ -578,57 +798,83 @@ namespace LanAutoConfig.Master
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-            var confirm = MessageBox.Show(
-                $"将向 {pending.Count} 台终端统一下发执行指令（以控制端审核后的配置为准）。确认继续？",
-                "确认下发", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
-            if (confirm != DialogResult.OK) return;
+            if (!ConfirmImpact("下发执行命令",
+                    "把每台的 IP / 掩码 / 网关 / DNS / 计算机名改成列表里的目标值（被控端立即执行，重启后完全生效）",
+                    pending))
+                return;
 
-            _dispatching = true;
-            _btnDispatch.Enabled = false;
+            await RunDispatchAsync(pending, "批量下发");
+        }
+
+        /// <summary>
+        /// 真正逐台发执行指令（后台线程调用）：带令牌、带加域参数，失败退回“待执行”以便重试。
+        /// 返回成功台数。供【下发执行命令】和【一键装机】共用。
+        /// </summary>
+        internal int DispatchExecute(IReadOnlyList<SlaveSessionItem> items)
+        {
+            if (items == null || items.Count == 0) return 0;
             string sessionId = _session.SessionId;
-            string bindIp = _broadcastIp;
+            string domain = _domain, domainUser = _domainUser, domainPwd = _domainPassword, ou = _ouPath, wg = _workgroup;
+            int ok = 0;
+
+            foreach (var it in items)
+            {
+                var msg = new MasterExecuteCmdMsg(sessionId)
+                {
+                    LocalMac = it.Mac,
+                    TargetHostName = it.TargetHostName,
+                    TargetIp = it.TargetIp,
+                    SubnetMask = it.SubnetMask,
+                    Gateway = it.Gateway,
+                    Dns1 = it.Dns1,
+                    Dns2 = it.Dns2,
+                    IsDhcp = it.IsDhcp,
+                    NeedAutoReboot = false,
+                    Workgroup = string.IsNullOrWhiteSpace(domain) ? wg : null,   // 加域与工作组二选一
+                    Domain = string.IsNullOrWhiteSpace(domain) ? null : domain,
+                    DomainUser = domainUser,
+                    DomainPassword = domainPwd,
+                    OuPath = ou
+                };
+                if (SendToItem(it, msg, out string err))
+                {
+                    _session.MarkExecuting(it.Mac);
+                    ok++;
+                    LogLine($"已下发执行：{it.TargetHostName} @ {it.SourceIp}（{it.Mac}）");
+                }
+                else
+                {
+                    // 退回待执行，允许重试（直接标失败会让这条记录再也发不出去）
+                    _session.MarkDispatchFailed(it.Mac, "下发失败：" + err);
+                    LogLine($"[下发失败] {it.TargetHostName}（{it.Mac}）：{err}");
+                }
+            }
+
             try
             {
-                await Task.Run(() =>
+                _db.Insert(new OpLogRecord
                 {
-                    int ok = 0, fail = 0;
-                    foreach (var it in pending)
-                    {
-                        var msg = new MasterExecuteCmdMsg(sessionId)
-                        {
-                            LocalMac = it.Mac,
-                            TargetHostName = it.TargetHostName,
-                            TargetIp = it.TargetIp,
-                            SubnetMask = it.SubnetMask,
-                            Gateway = it.Gateway,
-                            Dns1 = it.Dns1,
-                            Dns2 = it.Dns2,
-                            IsDhcp = it.IsDhcp,
-                            NeedAutoReboot = false
-                        };
-                        bool sent = TcpSend.SendTo(it.SourceIp, AppConfig.TcpPort, msg, bindIp);
-                        if (sent)
-                        {
-                            _session.MarkExecuting(it.Mac);
-                            ok++;
-                            SafeUi(() => LogLine($"已下发执行：{it.TargetHostName} @ {it.SourceIp}"));
-                        }
-                        else
-                        {
-                            // 退回待执行，允许重试（直接标失败会让这条记录再也发不出去）
-                            _session.MarkDispatchFailed(it.Mac, "下发失败（无法连接被控端）");
-                            fail++;
-                            SafeUi(() => LogLine($"[下发失败] {it.TargetHostName} @ {it.SourceIp}"));
-                        }
-                    }
-                    _db.Insert(new OpLogRecord
-                    {
-                        SessionId = sessionId,
-                        OpTime = DateTime.Now,
-                        Mac = "", SourceIp = "", TargetHostName = "[批量下发]", TargetIp = "",
-                        Result = $"成功{ok} 失败{fail}", ErrorMsg = ""
-                    });
+                    SessionId = sessionId,
+                    OpTime = DateTime.Now,
+                    Mac = "", SourceIp = "", TargetHostName = "[批量下发]", TargetIp = "",
+                    Result = $"成功{ok} 失败{items.Count - ok}", ErrorMsg = ""
                 });
+            }
+            catch { }
+
+            return ok;
+        }
+
+        /// <summary>把下发包成后台任务 + 按钮禁用 + 结束后刷新（避免 UI 线程被 5s×N 卡死）。</summary>
+        private async Task<int> RunDispatchAsync(IReadOnlyList<SlaveSessionItem> items, string label)
+        {
+            _dispatching = true;
+            _btnDispatch.Enabled = false;
+            try
+            {
+                int ok = await Task.Run(() => DispatchExecute(items));
+                LogLine($"{label}：成功 {ok} 台，失败 {items.Count - ok} 台");
+                return ok;
             }
             finally
             {
@@ -636,6 +882,7 @@ namespace LanAutoConfig.Master
                 _btnDispatch.Enabled = true;
                 RefreshGrid();
                 UpdateStatusBar();
+                ScheduleSave();
             }
         }
 
@@ -660,6 +907,15 @@ namespace LanAutoConfig.Master
             menu.Items.Add("批量删除选中", null, (s, e) => BatchDeleteSelected());
             menu.Items.Add("批量标记跳过", null, (s, e) => BatchSkipSelected(true));
             menu.Items.Add("批量取消跳过", null, (s, e) => BatchSkipSelected(false));
+            menu.Items.Add("重试选中（重新下发执行）", null, (s, e) =>
+            {
+                var items = SelectedItems().Where(x => !x.Skip).ToList();
+                if (items.Count == 0) { MessageBox.Show("请先选中要重试的终端（跳过的不发）。", "提示"); return; }
+                if (!ConfirmImpact("重试下发执行命令",
+                        "对这些终端重新下发 IP/主机名配置（失败重试、或改过目标值后用）", items)) return;
+                _ = RunDispatchAsync(items, "重试下发");
+            });
+            menu.Items.Add("连通性检测（选中）", null, (s, e) => ShowConnectivityDialog());
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("加入黑名单（MAC）", null, (s, e) =>
             {
@@ -724,6 +980,253 @@ namespace LanAutoConfig.Master
             using var dlg = new StaggerRebootForm(online);
             if (dlg.ShowDialog(this) == DialogResult.OK)
                 BatchRebootStaggered(dlg.BatchSize, dlg.IntervalSeconds);
+        }
+
+        // ---------- 一键装机流水线 ----------
+
+        /// <summary>供装机对话框读取/设置参数与阶段。</summary>
+        internal ProvisionJob Provision => _provision;
+
+        internal void RegisterProvisionHandlers(Action<string> logHandler, Action<ProvisionSummary> doneHandler)
+        {
+            _provisionLogHandlers += logHandler;
+            _provisionFinishedHandlers += doneHandler;
+        }
+
+        internal void UnregisterProvisionHandlers(Action<string> logHandler, Action<ProvisionSummary> doneHandler)
+        {
+            _provisionLogHandlers -= logHandler;
+            _provisionFinishedHandlers -= doneHandler;
+        }
+
+        /// <summary>开始一轮装机（参数由对话框预先写入 <see cref="Provision"/> 的 Options）。</summary>
+        internal void StartProvision(IEnumerable<string> macs)
+        {
+            _provision.Start(macs, DateTime.Now);
+            _provisionTimer.Start();
+            UpdateProvisionHint();
+            ScheduleSave();
+        }
+
+        internal void AbortProvision(string why)
+        {
+            _provision.Abort(why);
+            _provisionTimer.Stop();
+            UpdateProvisionHint();
+        }
+
+        /// <summary>1 秒推进：只做状态判断，真正的下发都在后台线程，UI 不会被卡住。</summary>
+        private void TickProvision()
+        {
+            if (_provision == null) { _provisionTimer.Stop(); return; }
+            var before = _provision.Stage;
+            _provision.Tick(DateTime.Now);
+            if (_provision.Stage != before)
+            {
+                UpdateProvisionHint();
+                RefreshGrid();       // 阶段切换时整表刷新一次（状态列会变），平时不刷
+                UpdateStatusBar();
+                ScheduleSave();
+            }
+            if (!_provision.Running)
+            {
+                _provisionTimer.Stop();
+                UpdateProvisionHint();
+            }
+        }
+
+        /// <summary>把流水线当前阶段显示在【一键装机】按钮上，关掉对话框也知道跑到哪一步了。</summary>
+        private void UpdateProvisionHint()
+        {
+            if (_btnProvision == null || _btnProvision.IsDisposed) return;
+            var job = _provision;
+            if (job == null || !job.Running) { _btnProvision.Text = "一键装机…"; return; }
+            // 按钮只有 100px 宽，写全阶段名会被截断，这里给“第几步 + 短名”
+            _btnProvision.Text = job.Stage switch
+            {
+                ProvisionStage.WaitingReport => "装机①等上报",
+                ProvisionStage.Dispatching => "装机②下发中",
+                ProvisionStage.WaitingExecute => "装机③执行中",
+                ProvisionStage.Rebooting => "装机④重启中",
+                ProvisionStage.WaitingOnline => "装机⑤等上线",
+                ProvisionStage.Verifying => "装机⑥验收中",
+                ProvisionStage.WaitingVerify => "装机⑦等回传",
+                _ => "装机中…"
+            };
+        }
+
+        private void OnProvisionFinished(ProvisionSummary s)
+        {
+            _provisionTimer.Stop();
+            UpdateProvisionHint();
+            LogLine("[流水线] " + s.Describe());
+            _provisionFinishedHandlers?.Invoke(s);
+        }
+
+        /// <summary>
+        /// 把流水线要做的动作接回主窗体。
+        /// 注意：Dispatch 必须在后台线程跑 —— DispatchExecute 是同步 TCP（5 秒超时 × N 台），
+        /// 在 UI 线程上发 60 台会让窗口“未响应”十分钟。
+        /// </summary>
+        private sealed class MasterProvisionOps : IProvisionOps
+        {
+            private readonly MasterForm _f;
+            public MasterProvisionOps(MasterForm f) { _f = f; }
+
+            public void Dispatch(IReadOnlyList<SlaveSessionItem> items)
+                => Task.Run(() => _f.DispatchExecute(items));
+
+            public void Reboot(IReadOnlyList<SlaveSessionItem> items)
+                => _f.RebootItems(items, _f._provision?.Options.RebootDelaySec ?? 10);
+
+            public void Verify(IReadOnlyList<SlaveSessionItem> items) => _f.VerifyItems(items);
+
+            public void Log(string msg)
+            {
+                _f.SafeUi(() => _f.LogLine("[流水线] " + msg));
+                _f.SafeUi(() => _f._provisionLogHandlers?.Invoke(msg));
+            }
+
+            public void Finished(ProvisionSummary s) => _f.SafeUi(() => _f.OnProvisionFinished(s));
+        }
+
+        /// <summary>按 MAC 批量标记/取消跳过（IP 占用扫描里“跳过冲突机”用）。</summary>
+        internal void MarkSkipMacs(IEnumerable<string> macs, bool skip)
+        {
+            if (macs == null) return;
+            var list = macs.Where(x => !string.IsNullOrWhiteSpace(x)).ToList();
+            if (list.Count == 0) return;
+            _session.SetSkipMany(list, skip);
+            LogLine($"已{(skip ? "标记跳过" : "取消跳过")} {list.Count} 台终端（来自 IP 占用扫描）");
+            RefreshGrid();
+            UpdateStatusBar();
+            ScheduleSave();
+        }
+
+        /// <summary>一键装机流水线。</summary>
+        private void ShowProvisionDialog()
+        {
+            if (!_broadcasting)
+            {
+                MessageBox.Show("请先点【开始发布模板】。\n\n流水线要靠广播让被控端上报，再自动跑后续步骤。",
+                    "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (ConflictValidator.HasConflict(_session.Items))
+            {
+                MessageBox.Show("存在目标 IP / 主机名冲突，请先修掉（或跳过其中一台）再跑流水线。",
+                    "冲突", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            using var dlg = new ProvisionForm(this);
+            dlg.ShowDialog(this);
+            RefreshGrid();
+            UpdateStatusBar();
+            ScheduleSave();
+        }
+
+        /// <summary>文件分发 / 静默装软件。</summary>
+        private void ShowFilePushDialog()
+        {
+            using var dlg = new FilePushForm(this);
+            dlg.ShowDialog(this);
+        }
+
+        /// <summary>远程截图。</summary>
+        private void ShowScreenshotDialog()
+        {
+            using var dlg = new ScreenshotForm(this);
+            dlg.ShowDialog(this);
+        }
+
+        /// <summary>真实 IP 冲突扫描。</summary>
+        private void ShowIpScanDialog()
+        {
+            using var dlg = new IpScanForm(this);
+            dlg.ShowDialog(this);
+            RefreshGrid();
+        }
+
+        /// <summary>连通性矩阵：ping + 被控端端口一起探，分清“掉线”还是“程序没跑”。</summary>
+        private void ShowConnectivityDialog()
+        {
+            using var dlg = new ConnectivityForm(this);
+            dlg.ShowDialog(this);
+        }
+
+        /// <summary>加域 / 工作组设置（只改控制端本地参数，随模板一起下发）。</summary>
+        private void ShowDomainJoinDialog()
+        {
+            using var dlg = new DomainJoinForm(_workgroup, _domain, _domainUser, _domainPassword, _ouPath);
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            _workgroup = dlg.Workgroup;
+            _domain = dlg.DomainName;
+            _domainUser = dlg.DomainUser;
+            _domainPassword = dlg.DomainPassword;
+            _ouPath = dlg.OuPath;
+            ScheduleSave();
+            UpdateDomainHint();
+            LogLine(string.IsNullOrEmpty(_domain)
+                ? $"加域设置已更新：工作组「{_workgroup ?? "(不改)"}」"
+                : $"加域设置已更新：域「{_domain}」账号 {_domainUser}" + (string.IsNullOrEmpty(_ouPath) ? "" : $"，OU {_ouPath}"));
+        }
+
+        // ---------- 列显示自定义 ----------
+
+        /// <summary>右键表头：勾选要显示的列（终端多了以后可以隐藏不关心的列）。</summary>
+        private void ShowColumnMenu(Point screenPos)
+        {
+            var menu = new ContextMenuStrip();
+            foreach (DataGridViewColumn col in _grid.Columns)
+            {
+                if (col.Name == "colMac") continue;   // MAC 列不允许隐藏（不然滑到右边认不出是哪台）
+                var item = new ToolStripMenuItem(col.HeaderText)
+                {
+                    Checked = !_hiddenColumns.Contains(col.Name),
+                    CheckOnClick = false
+                };
+                string name = col.Name;
+                item.Click += (s, e) => ToggleColumn(name);
+                menu.Items.Add(item);
+            }
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("全部显示", null, (s, e) =>
+            {
+                _hiddenColumns.Clear();
+                ApplyColumnVisibility();
+                ScheduleSave();
+            });
+            menu.Show(_grid, _grid.PointToClient(screenPos));
+        }
+
+        private void ToggleColumn(string name)
+        {
+            if (_hiddenColumns.Contains(name)) _hiddenColumns.Remove(name);
+            else
+            {
+                // 至少留一列可见，否则整张表会变成空白，看着像坏了
+                int visible = _grid.Columns.Cast<DataGridViewColumn>().Count(c => c.Visible);
+                if (visible <= 1) return;
+                _hiddenColumns.Add(name);
+            }
+            ApplyColumnVisibility();
+            ScheduleSave();
+        }
+
+        private void ApplyColumnVisibility()
+        {
+            if (_grid == null || _grid.IsDisposed) return;
+            foreach (DataGridViewColumn col in _grid.Columns)
+                col.Visible = !_hiddenColumns.Contains(col.Name);
+        }
+
+        /// <summary>把当前加域/工作组设置显示在按钮上，一眼能看出这轮会不会加域。</summary>
+        private void UpdateDomainHint()
+        {
+            if (_btnDomainJoin == null || _btnDomainJoin.IsDisposed) return;
+            if (!string.IsNullOrWhiteSpace(_domain)) _btnDomainJoin.Text = "加域：" + _domain;
+            else if (!string.IsNullOrWhiteSpace(_workgroup)) _btnDomainJoin.Text = "工作组：" + _workgroup;
+            else _btnDomainJoin.Text = "加域/工作组设置…";
         }
 
         private void BatchDeleteSelected()
@@ -844,22 +1347,18 @@ namespace LanAutoConfig.Master
         /// <summary>向单台终端下发重启指令，并登记到“待自动验收”集合（重启上线后自动补验收）。</summary>
         private bool SendRebootTo(SlaveSessionItem it, int delaySeconds)
         {
-            string sid = _session.SessionId;
-            string bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
-            string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
-            if (string.IsNullOrEmpty(target))
+            var cmd = new MasterRebootCmdMsg(_session.SessionId)
             {
-                LogLine($"[重启] {it.TargetHostName}（{it.Mac}）无可用目标地址，跳过");
-                return false;
-            }
-            var cmd = new MasterRebootCmdMsg(sid) { LocalMac = it.Mac, DelaySeconds = Math.Max(0, Math.Min(600, delaySeconds)) };
-            if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err))
+                LocalMac = it.Mac,
+                DelaySeconds = Math.Max(0, Math.Min(600, delaySeconds))
+            };
+            if (SendToItem(it, cmd, out string err))
             {
                 lock (_rebootLock) _rebootSent.Add(it.Mac);
-                LogLine($"[重启] 已下发：{it.TargetHostName}（{target}）");
+                LogLine($"[重启] 已下发：{it.TargetHostName}（{it.SourceIp ?? it.TargetIp}）");
                 return true;
             }
-            LogLine($"[重启] {it.TargetHostName}（{target}）下发失败：{err}");
+            LogLine($"[重启] {it.TargetHostName}（{it.Mac}）下发失败：{err}");
             return false;
         }
 
@@ -982,24 +1481,17 @@ namespace LanAutoConfig.Master
             {
                 var it = kv.Key;
                 string suffix = kv.Value;
-                string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
-                if (string.IsNullOrEmpty(target))
-                {
-                    fail++;
-                    LogLine($"[编号] {it.Mac} 没有可用地址（既无来源 IP 也无目标 IP），跳过");
-                    continue;
-                }
                 var cmd = new MasterAssignSuffixCmdMsg(sid, it.Mac, suffix);
-                if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err))
+                if (SendToItem(it, cmd, out string err))
                 {
                     ok++;
                     it.Suffix = suffix;      // 先记下来让界面有反馈；被控端上报回来后以它为准
-                    LogLine($"[编号] {it.Mac}（{target}）← {suffix}");
+                    LogLine($"[编号] {it.Mac}（{it.SourceIp ?? it.TargetIp}）← {suffix}");
                 }
                 else
                 {
                     fail++;
-                    LogLine($"[编号] {it.Mac}（{target}）下发失败：{err}");
+                    LogLine($"[编号] {it.Mac}（{it.SourceIp ?? it.TargetIp}）下发失败：{err}");
                 }
             }
 
@@ -1028,14 +1520,11 @@ namespace LanAutoConfig.Master
                     "批量关机", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
 
             string sid = _session.SessionId;
-            string bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
             SendBatchBackground(items, it =>
             {
-                string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
-                if (string.IsNullOrEmpty(target)) { LogLine($"[关机] {it.TargetHostName}（{it.Mac}）没有可用地址，跳过"); return false; }
                 var cmd = new MasterShutdownCmdMsg(sid) { LocalMac = it.Mac, DelaySeconds = 10 };
-                if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err)) return true;
-                LogLine($"[关机] {it.TargetHostName}（{target}）下发失败：{err}");
+                if (SendToItem(it, cmd, out string err)) return true;
+                LogLine($"[关机] {it.TargetHostName}（{it.Mac}）下发失败：{err}");
                 return false;
             }, (ok, fail) =>
             {
@@ -1071,18 +1560,11 @@ namespace LanAutoConfig.Master
                     enable ? MessageBoxIcon.Question : MessageBoxIcon.Warning) != DialogResult.OK) return;
 
             string sid = _session.SessionId;
-            string bindIp = SelectedBroadcastIp() ?? NetworkHelper.GetLocalIpv4();
             SendBatchBackground(items, it =>
             {
-                string target = string.IsNullOrEmpty(it.SourceIp) ? it.TargetIp : it.SourceIp;
-                if (string.IsNullOrEmpty(target))
-                {
-                    LogLine($"[自启] {it.TargetHostName}（{it.Mac}）没有可用地址，跳过");
-                    return false;
-                }
                 var cmd = new MasterAutostartCmdMsg(sid, it.Mac, enable);
-                if (TcpSend.SendTo(target, AppConfig.TcpPort, cmd, bindIp, out string err)) return true;
-                LogLine($"[自启] {it.TargetHostName}（{target}）下发失败：{err}");
+                if (SendToItem(it, cmd, out string err)) return true;
+                LogLine($"[自启] {it.TargetHostName}（{it.Mac}）下发失败：{err}");
                 return false;
             }, (ok, fail) =>
             {
@@ -1575,7 +2057,10 @@ namespace LanAutoConfig.Master
             return new TemplateModel
             {
                 IpPrefix = ipPrefix, SubnetMask = mask, Gateway = gw,
-                Dns1 = dns1, Dns2 = dns2, HostNamePrefix = hn, IsDhcp = dhcp
+                Dns1 = dns1, Dns2 = dns2, HostNamePrefix = hn, IsDhcp = dhcp,
+                // 工作组/域只需域名进广播（用于被控端界面显示），域凭据留在控制端，下发执行时才单播
+                Workgroup = string.IsNullOrWhiteSpace(_domain) ? _workgroup : null,
+                Domain = string.IsNullOrWhiteSpace(_domain) ? null : _domain
             };
         }
 
@@ -1725,6 +2210,12 @@ namespace LanAutoConfig.Master
             };
             tbl.Controls.Add(_chkDhcp, 1, 3);
 
+            _btnDomainJoin = new Button { Text = "加域/工作组设置…", Height = 26, Dock = DockStyle.Fill, Margin = new Padding(0, 2, 0, 0) };
+            _btnDomainJoin.Click += (s, e) => ShowDomainJoinDialog();
+            tbl.Controls.Add(_btnDomainJoin, 3, 3);
+            var tipDomain = new ToolTip();
+            tipDomain.SetToolTip(_btnDomainJoin, "执行配置时顺便加入域或工作组（域凭据只在单播的执行指令里，不随广播下发）");
+
             var lblHint = new Label
             {
                 Text = "拼接规则：主机名 = 前缀 + 后缀原文；IP 末段 = 后缀编号 + 1（编号 1 → .2，把 .1 留给网关）。模板每 2.5 秒广播一次。",
@@ -1842,6 +2333,56 @@ namespace LanAutoConfig.Master
             bar2.Controls.Add(btnStagger);
             bar2.Controls.Add(btnVerify);
 
+            // ---- 第四行：一键装机 / 文件分发 / 远程截图 / 程序控制 / 网络扫描 ----
+            bar2.SetFlowBreak(btnVerify, true);
+            var btnProvision = new Button { Text = "一键装机…", Width = 100, Height = 32 };
+            btnProvision.Click += (s, e) => ShowProvisionDialog();
+            MakePrimary(btnProvision);
+            _btnProvision = btnProvision;
+            var btnFilePush = new Button { Text = "文件分发", Width = 100, Height = 32 };
+            btnFilePush.Click += (s, e) => ShowFilePushDialog();
+            var btnShot = new Button { Text = "远程截图", Width = 100, Height = 32 };
+            btnShot.Click += (s, e) => ShowScreenshotDialog();
+            var btnProc = new Button { Text = "重启被控端", Width = 110, Height = 32 };
+            btnProc.Click += (s, e) =>
+            {
+                var items = SelectedItemsOrAllOnline();
+                if (items.Count == 0) { MessageBox.Show("没有可操作的终端。", "提示"); return; }
+                if (MessageBox.Show($"让选中的 {items.Count} 台终端重启被控端程序？（不重启电脑，只重开程序）\n\n" +
+                                    "适用于程序卡住、或需要重新读一次本地配置的情况。", "重启被控端",
+                        MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+                SendProcCmd(items, "restart");
+            };
+            var btnQuit = new Button { Text = "退出被控端", Width = 110, Height = 32 };
+            btnQuit.Click += (s, e) =>
+            {
+                var items = SelectedItemsOrAllOnline();
+                if (items.Count == 0) { MessageBox.Show("没有可操作的终端。", "提示"); return; }
+                if (MessageBox.Show($"让选中的 {items.Count} 台终端退出被控端程序？\n\n" +
+                                    "退出后这些机器将不再响应任何指令，需要现场或开机自启重新拉起。", "退出被控端",
+                        MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
+                SendProcCmd(items, "exit");
+            };
+            var btnIpScan = new Button { Text = "IP占用扫描", Width = 110, Height = 32 };
+            btnIpScan.Click += (s, e) => ShowIpScanDialog();
+            var btnProbe = new Button { Text = "连通性检测", Width = 110, Height = 32 };
+            btnProbe.Click += (s, e) => ShowConnectivityDialog();
+
+            tipBar.SetToolTip(btnProvision, "一条流水线跑完：等上报 → 自动下发 → 失败自动重试 → 自动重启 → 等上线 → 自动验收 → 出汇总");
+            tipBar.SetToolTip(btnFilePush, "把安装包/脚本推到被控端并静默执行（内置文件服务，带 SHA256 校验）");
+            tipBar.SetToolTip(btnShot, "让被控端截一张当前桌面回传，看它卡在哪个界面");
+            tipBar.SetToolTip(btnProc, "只重启被控端程序（不重启电脑），程序卡死时用");
+            tipBar.SetToolTip(btnQuit, "让被控端程序退出（慎用：退出后不再响应指令）");
+            tipBar.SetToolTip(btnIpScan, "扫描目标 IP 在网段里是否已被别的机器占用（读 ARP 表，能发现模板冲突之外的“老机器占地址”）");
+            tipBar.SetToolTip(btnProbe, "同时探 ping 和 48889 端口：分清是掉线、还是机器在但被控端没跑/被防火墙拦");
+            bar2.Controls.Add(btnProvision);
+            bar2.Controls.Add(btnFilePush);
+            bar2.Controls.Add(btnShot);
+            bar2.Controls.Add(btnProc);
+            bar2.Controls.Add(btnQuit);
+            bar2.Controls.Add(btnIpScan);
+            bar2.Controls.Add(btnProbe);
+
             _lblGridHint = new Label
             {
                 Text = "提示：可多选（Ctrl/Shift），右键批量删除/标记；双击“目标主机名 / 目标 IP”可直接改",
@@ -1911,6 +2452,11 @@ namespace LanAutoConfig.Master
             _grid.Columns[cHost].ReadOnly = false;
             _grid.Columns[cIp].ReadOnly = false;
             _grid.CellEndEdit += _grid_CellEndEdit;
+            // 右键表头：勾选要显示的列（终端多了以后可以隐藏不关心的列，随配置保存）
+            _grid.ColumnHeaderMouseClick += (s, e) =>
+            {
+                if (e.Button == MouseButtons.Right) ShowColumnMenu(Cursor.Position);
+            };
             GridContextMenu();
             tab2.Controls.Add(_grid);
             tab2.Controls.SetChildIndex(_grid, 0);
@@ -2032,6 +2578,12 @@ namespace LanAutoConfig.Master
                     // 注意：下拉框里的元素是 BroadcastAdapter（包了一层网卡信息 + 该网卡的 IPv4），
                     // 原来这里写的是 as NetworkAdapterInfo，永远转不成 null，等于“选的网卡从来没被记住”。
                     AdapterAlias = (_cmbAdapter.SelectedItem as BroadcastAdapter)?.Adapter?.Alias,
+                    Workgroup = _workgroup,
+                    Domain = _domain,
+                    DomainUser = _domainUser,
+                    DomainPassword = _domainPassword,
+                    OuPath = _ouPath,
+                    HiddenColumns = _hiddenColumns.ToList(),
                     Items = _session.Items.ToList()
                 };
                 if (!s.Save(_settingsPath))
@@ -2061,6 +2613,17 @@ namespace LanAutoConfig.Master
                 if (!string.IsNullOrEmpty(s.HostNamePrefix)) _txtHnPrefix.Text = s.HostNamePrefix;
                 _chkDhcp.Checked = s.IsDhcp;
                 _chkDhcpServer.Checked = s.DhcpServer;
+
+                _workgroup = s.Workgroup;
+                _domain = s.Domain;
+                _domainUser = s.DomainUser;
+                _domainPassword = s.DomainPassword;
+                _ouPath = s.OuPath;
+                UpdateDomainHint();
+
+                _hiddenColumns.Clear();
+                foreach (string c in s.HiddenColumns) if (!string.IsNullOrWhiteSpace(c)) _hiddenColumns.Add(c);
+                ApplyColumnVisibility();
 
                 if (!string.IsNullOrEmpty(s.AdapterAlias))
                 {
