@@ -70,14 +70,36 @@ namespace LanAutoConfig.Slave
 
             string gwArg = string.IsNullOrWhiteSpace(gateway) ? "" : $" -DefaultGateway '{EscapePs(gateway.Trim())}'";
 
+            // 关键点（现场踩过）：Set-NetIPInterface -Dhcp Disabled 只是关掉"继续要租约"，
+            // 已经拿到的 DHCP 租约地址**不会自动消失**，会和新静态地址并存（网卡同时挂两个 IPv4）。
+            // 所以必须逐个删掉本网卡全部 IPv4；Remove-NetIPAddress 在部分机器上会静默失败
+            // （之前用 -ErrorAction SilentlyContinue 把失败吞了，残留地址无人知晓），这里对每个地址
+            // 单独删除、失败再用 netsh 兜底，最后校验一遍并把结果写回日志。
             string script = $@"
 $ErrorActionPreference='Stop'
 $if='{EscapePs(ifAlias)}'
 Set-NetIPInterface -InterfaceAlias $if -Dhcp Disabled -ErrorAction Stop
-Remove-NetIPAddress -InterfaceAlias $if -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+Get-NetIPAddress -InterfaceAlias $if -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  ForEach-Object {{
+    $a = [string]$_.IPAddress
+    try {{ Remove-NetIPAddress -InterfaceAlias $if -IPAddress $a -Confirm:$false -ErrorAction Stop }}
+    catch {{ netsh interface ipv4 delete address $if $a | Out-Null }}
+  }}
 Remove-NetRoute -InterfaceAlias $if -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+$rest = @()
+for ($i=0; $i -lt 10; $i++) {{
+    $rest = @(Get-NetIPAddress -InterfaceAlias $if -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+    if ($rest.Count -eq 0) {{ break }}
+    Start-Sleep -Milliseconds 500
+}}
+if ($rest.Count -gt 0) {{
+    Write-Output ('WARN: 以下旧地址未能清除: ' + (($rest | ForEach-Object {{ [string]$_.IPAddress }}) -join ', '))
+}}
 New-NetIPAddress -InterfaceAlias $if -IPAddress '{EscapePs(ip.Trim())}' -PrefixLength {prefix}{gwArg} -ErrorAction Stop
 {dnsCmd}
+$final = @(Get-NetIPAddress -InterfaceAlias $if -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+           ForEach-Object {{ [string]$_.IPAddress }})
+Write-Output ('配置完成，网卡当前 IPv4: ' + ($final -join ', '))
 ";
             return RunPs(script);
         }
@@ -89,11 +111,19 @@ New-NetIPAddress -InterfaceAlias $if -IPAddress '{EscapePs(ip.Trim())}' -PrefixL
 
             // 关键：静态配置过的网卡 EnableDHCP=0，只删地址并不会自动去要 DHCP，
             // 否则网卡会掉进 169.254.x.x 失联。必须先 Set-NetIPInterface -Dhcp Enabled。
+            // 清旧地址时只删非 DHCP 来源的（静态/临时残留）；如果此刻租约刚下来，
+            // 删了它 ipconfig /renew 也能再要到，但不做无谓的折腾。
             string script = $@"
 $ErrorActionPreference='Stop'
 $if='{EscapePs(ifAlias)}'
 Set-NetIPInterface -InterfaceAlias $if -Dhcp Enabled -ErrorAction Stop
-Remove-NetIPAddress -InterfaceAlias $if -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+Get-NetIPAddress -InterfaceAlias $if -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.PrefixOrigin -ne 'Dhcp' }} |
+  ForEach-Object {{
+    $a = [string]$_.IPAddress
+    try {{ Remove-NetIPAddress -InterfaceAlias $if -IPAddress $a -Confirm:$false -ErrorAction Stop }}
+    catch {{ netsh interface ipv4 delete address $if $a | Out-Null }}
+  }}
 Remove-NetRoute -InterfaceAlias $if -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
 Set-DnsClientServerAddress -InterfaceAlias $if -ResetServerAddresses -ErrorAction Stop
 ipconfig /renew $if | Out-Null
@@ -103,6 +133,9 @@ for ($i=0; $i -lt 15; $i++) {{
     Start-Sleep -Seconds 1
 }}
 if (-not $ok) {{ Write-Warning '已切换为 DHCP，但 15 秒内未取得 IPv4 地址（请检查 DHCP 服务器/网线）' }}
+$final = @(Get-NetIPAddress -InterfaceAlias $if -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+           ForEach-Object {{ [string]$_.IPAddress }})
+Write-Output ('配置完成，网卡当前 IPv4: ' + ($final -join ', '))
 ";
             return RunPs(script);
         }

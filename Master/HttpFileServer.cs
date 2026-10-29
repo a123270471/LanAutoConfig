@@ -127,7 +127,7 @@ namespace LanAutoConfig.Master
                     await _slots.WaitAsync();
                     leased = true;
                     using var fs = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, useAsync: true);
-                    await fs.CopyToAsync(client.GetStream());
+                    await CopyWithStallTimeoutAsync(fs, client.GetStream());
                     Log?.Invoke($"[文件服务] {remote} 已下载 {name}（{len / 1024} KB）");
                 }
                 catch (Exception ex)
@@ -139,6 +139,24 @@ namespace LanAutoConfig.Master
                 {
                     if (leased) { try { _slots.Release(); } catch { } }
                 }
+            }
+        }
+
+        /// <summary>
+        /// 带停滞超时的复制：任何一步超过 30 秒没有进展就放弃并断开。
+        ///
+        /// 为什么不能用 <see cref="Stream.CopyToAsync"/>：socket 的 SendTimeout 只对同步 IO 生效，
+        /// 对异步写不生效 —— 被控端下载中途断电/换 IP 后，TCP 半开连接会让 CopyToAsync 挂住几个小时，
+        /// 文件句柄一直占着，之后再分发同名文件就会覆盖失败（"Access to the path is denied"）。
+        /// </summary>
+        private static async Task CopyWithStallTimeoutAsync(Stream src, Stream dst, int stallMs = 30000)
+        {
+            var buf = new byte[64 * 1024];
+            while (true)
+            {
+                int n = await src.ReadAsync(buf, 0, buf.Length).WaitAsync(TimeSpan.FromMilliseconds(stallMs));
+                if (n <= 0) return;
+                await dst.WriteAsync(buf, 0, n).WaitAsync(TimeSpan.FromMilliseconds(stallMs));
             }
         }
 

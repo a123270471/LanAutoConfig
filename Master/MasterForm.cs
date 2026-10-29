@@ -472,7 +472,7 @@ namespace LanAutoConfig.Master
                 fileName = Path.GetFileName(localPath);
                 string dest = Path.Combine(AppConfig.FileShareDir, fileName);
                 if (!string.Equals(Path.GetFullPath(localPath), Path.GetFullPath(dest), StringComparison.OrdinalIgnoreCase))
-                    File.Copy(localPath, dest, overwrite: true);
+                    CopyOverwriteResilient(localPath, dest);
 
                 size = new FileInfo(dest).Length;
                 sha256 = ComputeFileSha256(dest);
@@ -485,6 +485,44 @@ namespace LanAutoConfig.Master
                 error = "准备文件失败：" + ex.Message;
                 return false;
             }
+        }
+
+        /// <summary>
+        /// 覆盖复制到分发目录，带三重兜底：
+        /// ① 清掉旧文件可能残留的只读属性（File.Copy 遇只读目标必报 Access denied）；
+        /// ② 先删旧文件再复制，失败重试 3 次（文件服务可能还有一条僵死下载占着句柄）；
+        /// ③ 仍失败就换「名_时分秒」的唯一文件名暂存 —— 被占用的只是旧副本，新分发不该被它堵死。
+        /// </summary>
+        private static void CopyOverwriteResilient(string src, string dest)
+        {
+            if (File.Exists(dest))
+            {
+                try { File.SetAttributes(dest, FileAttributes.Normal); } catch { }
+            }
+            for (int i = 0; i < 3; i++)
+            {
+                try
+                {
+                    try { if (File.Exists(dest)) File.Delete(dest); } catch { }
+                    File.Copy(src, dest, overwrite: true);
+                    return;
+                }
+                catch (UnauthorizedAccessException) when (i < 2)
+                {
+                    Thread.Sleep(400);
+                }
+                catch (IOException) when (i < 2)
+                {
+                    Thread.Sleep(400);
+                }
+            }
+
+            // 最后兜底：换个唯一名字，保证这次分发能走下去
+            string dir = Path.GetDirectoryName(dest) ?? ".";
+            string bare = Path.GetFileNameWithoutExtension(dest);
+            string ext = Path.GetExtension(dest);
+            string unique = Path.Combine(dir, $"{bare}_{DateTime.Now:HHmmss}{ext}");
+            File.Copy(src, unique, overwrite: false);
         }
 
         /// <summary>向单台终端下发文件（下载 + 可选执行）。</summary>

@@ -724,3 +724,18 @@ v3.0（资产 / 在线状态 / 白名单，本轮进行中）：
 
 99. **终端列表删掉「状态」「错误信息」两列**：失败原因已由「失败归类」列 + 行级红/灰着色 + 日志报表覆盖，
     两列内容冗余且占宽度；错误详情仍保留在单元格悬停提示（失败归类列）与 SQLite 日志里。
+
+100. **修复：文件分发选择文件报「Access to the path … is denied」**（`Master/MasterForm.cs`、`Master/HttpFileServer.cs`）：
+    根因是**文件服务把句柄占死了** —— 下载用的 `CopyToAsync` 没有超时，而 socket 的 `SendTimeout`
+    只对同步 IO 生效、对异步写不生效；被控端下载中途断电/换 IP 后，TCP 半开连接让复制挂住几小时，
+    分发目录里那个 exe 的句柄一直被占，下次再分发同名文件覆盖复制必然失败。两层修复：
+    - 文件服务换成带停滞检测的复制循环（任何一步 30 秒无进展就断开，句柄立刻释放）；
+    - 暂存复制 `CopyOverwriteResilient` 三重兜底：清旧文件只读属性 → 先删后复制 + 重试 3 次 →
+      仍占用就换「名_时分秒」唯一文件名暂存，新分发不被旧副本堵死。
+
+101. **修复：改静态 IP 后旧 DHCP 地址残留（网卡同时挂两个 IPv4）**（`Slave/LocalNetChanger.cs`）：
+    `Set-NetIPInterface -Dhcp Disabled` 只是关掉"继续要租约"，**已经拿到的 DHCP 租约不会自动消失**；
+    而 `Remove-NetIPAddress -ErrorAction SilentlyContinue` 在部分机器上失败时被静默吞掉，残留无人知晓。
+    现在 `SetStaticIp` / `SetDhcp` 改为逐个删除本网卡 IPv4（Remove-NetIPAddress 失败用 netsh 兜底）、
+    轮询确认清干净（清不掉的写 WARN 进执行结果），配置完成后把网卡当前 IPv4 列表回传到日志；
+    恢复 DHCP 时只删非 DHCP 来源的地址，避免误杀刚拿到的租约。
