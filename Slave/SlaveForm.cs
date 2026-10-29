@@ -31,6 +31,8 @@ namespace LanAutoConfig.Slave
         /// 关机期间新建进程必然 0xc0000142 并弹一个“powershell.exe 应用程序错误”的框。
         /// </summary>
         private volatile bool _osShuttingDown;
+        /// <summary>退出原因（写进给控制端的下线通知里，便于日志区分“手动关”还是“升级重启”）。</summary>
+        private string _exitReason = "程序退出";
 
         // UI
         private Label _lblStatus, _lblTmplIp, _lblTmplMask, _lblTmplGw, _lblTmplDns, _lblTmplHn, _lblTmplDhcp, _lblSession;
@@ -109,6 +111,14 @@ namespace LanAutoConfig.Slave
             InitAutostart();   // 开机自启：界面勾选状态与注册表实际内容对齐（默认开启）
             FormClosing += (s, e) =>
             {
+                // 先“打招呼”再收摊：告诉控制端本机要下线了，列表里那一格立刻变离线，
+                // 不用再干等心跳超时（原来关了程序还要显示在线几十秒）。
+                // 系统关机/重启时不发：那是整机断电流程，控制端那边也快下线了，别去抢时间。
+                if (!_osShuttingDown && !LocalNetChanger.ShutdownInProgress)
+                {
+                    try { _hb.NotifyOffline(_exitReason); } catch { }
+                }
+
                 // 关机/重启引起的关闭：不要清临时 IP（那要拉起 PowerShell，关机窗口里必失败并弹错误框）。
                 // 地址是临时的，下次开机由 DHCP/模板配置重新决定，留着也不会影响什么。
                 if (!_osShuttingDown && !LocalNetChanger.ShutdownInProgress)
@@ -659,6 +669,7 @@ namespace LanAutoConfig.Slave
                         return;   // 没启动成功就别退出，留在旧版本还能用
                     }
                     Program.ReleaseSingleInstance();   // 释放单实例锁，否则新进程会被自己挡住
+                    _exitReason = "自升级替换";
                     Application.Exit();
                 });
             });
@@ -719,6 +730,7 @@ namespace LanAutoConfig.Slave
                 LogLine("重启程序失败：" + ex.Message);
                 return;
             }
+            _exitReason = "按控制端指令重启程序";
             Application.Exit();
         }
 
@@ -758,10 +770,8 @@ namespace LanAutoConfig.Slave
             && string.Equals(a.Dns2, b.Dns2, StringComparison.Ordinal)
             && string.Equals(a.HostNamePrefix, b.HostNamePrefix, StringComparison.Ordinal)
             && a.IsDhcp == b.IsDhcp
-            && string.Equals(a.Workgroup, b.Workgroup, StringComparison.Ordinal)
             && string.Equals(a.TimeZoneId, b.TimeZoneId, StringComparison.Ordinal)
-            && a.SyncTime == b.SyncTime
-            && string.Equals(a.Domain, b.Domain, StringComparison.Ordinal);
+            && a.SyncTime == b.SyncTime;
 
         private void OnReset()
         {
@@ -1010,19 +1020,13 @@ namespace LanAutoConfig.Slave
                 }
                 else
                 {
-                    PsResult r1 = null, r2 = null, r3 = null;
+                    PsResult r1 = null, r2 = null;
                     await Task.Run(() =>
                     {
                         r1 = cmd.IsDhcp
                             ? _changer.SetDhcp(ifAlias)
                             : _changer.SetStaticIp(ifAlias, cmd.TargetIp, cmd.SubnetMask, cmd.Gateway, cmd.Dns1, cmd.Dns2);
                         r2 = _changer.RenameComputer(cmd.TargetHostName);
-                        // 加域必须放在改名之后：域里是按新主机名建计算机对象的。
-                        // 域凭据只在单播的执行指令里，不随 UDP 广播下发。
-                        if (!string.IsNullOrWhiteSpace(cmd.Domain))
-                            r3 = _changer.JoinDomain(cmd.Domain, cmd.DomainUser, cmd.DomainPassword, cmd.OuPath);
-                        else if (!string.IsNullOrWhiteSpace(cmd.Workgroup))
-                            r3 = _changer.SetWorkgroup(cmd.Workgroup);
                     });
 
                     if (r1 == null || r2 == null) { success = false; sb.AppendLine("内部错误：执行结果为空"); }
@@ -1033,13 +1037,6 @@ namespace LanAutoConfig.Slave
 
                         if (r2.Success) sb.AppendLine("重命名成功（重启后完全生效）");
                         else { success = false; sb.AppendLine("重命名失败：" + r2.Error); }
-
-                        if (r3 != null)
-                        {
-                            string what = string.IsNullOrWhiteSpace(cmd.Domain) ? "加入工作组" : $"加入域 {cmd.Domain}";
-                            if (r3.Success) sb.AppendLine(what + "成功（重启后生效）");
-                            else { success = false; sb.AppendLine(what + "失败：" + r3.Error); }
-                        }
 
                         // PowerShell 的警告/输出一并写到本地日志，便于排查
                         if (!string.IsNullOrEmpty(r1.Output)) sb.AppendLine("PS 输出：" + r1.Output);

@@ -75,7 +75,7 @@ namespace LanAutoConfig.Master
                 {
                     var msg = new BroadcastTemplateMsg(_sessionId, _template.IpPrefix, _template.SubnetMask,
                         _template.Gateway, _template.Dns1, _template.Dns2, _template.HostNamePrefix, _template.IsDhcp,
-                        _template.Workgroup, _template.TimeZoneId, _template.SyncTime, _template.Domain);
+                        _template.TimeZoneId, _template.SyncTime);
                     string json = JsonHelper.Serialize(msg);
                     byte[] bytes = Encoding.UTF8.GetBytes(json);
                     var udp = _udp;

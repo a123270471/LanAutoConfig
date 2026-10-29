@@ -163,8 +163,36 @@ namespace LanAutoConfig.Slave
             return first;
         }
 
-        /// <summary>轻量发送：2 秒超时、不重试、不绑定源地址。</summary>
-        private static bool SendLight(string ip, int port, NetMessage msg, out string error)
+        /// <summary>
+        /// 正常退出前给控制端发一条“告别”消息，控制端收到就把本机立刻显示为离线。
+        ///
+        /// 不走重试、最多等 <paramref name="timeoutMs"/> 毫秒：关机/退出流程不能被网络卡住，
+        /// 发不出去就算了（控制端还有心跳超时兜底）。
+        /// </summary>
+        public void NotifyOffline(string reason, int timeoutMs = 800)
+        {
+            string ip, sid, mac, host, token;
+            lock (_lock)
+            {
+                ip = _masterIp; sid = _sessionId; mac = _mac; host = _hostName; token = _token;
+            }
+            if (string.IsNullOrEmpty(ip) || string.IsNullOrEmpty(sid) || string.IsNullOrEmpty(mac)) return;
+
+            var msg = new SlaveOfflineMsg(sid)
+            {
+                LocalMac = mac,
+                HostName = host,
+                Reason = string.IsNullOrEmpty(reason) ? "程序退出" : reason,
+                Token = token ?? ""
+            };
+            if (!SendLight(ip, AppConfig.TcpPort, msg, out string err, timeoutMs))
+            {
+                try { Log?.Invoke($"下线通知发送失败（{ip}）：{err}（控制端会在心跳超时后置离线）"); } catch { }
+            }
+        }
+
+        /// <summary>轻量发送：默认 2 秒超时、不重试、不绑定源地址。</summary>
+        private static bool SendLight(string ip, int port, NetMessage msg, out string error, int timeoutMs = 2000)
         {
             error = null;
             if (!IPAddress.TryParse(ip, out IPAddress dest)) { error = "目标 IP 不合法"; return false; }
@@ -173,9 +201,10 @@ namespace LanAutoConfig.Slave
             {
                 client = new TcpClient();
                 Task connect = client.ConnectAsync(dest, port);
-                if (!connect.Wait(2000)) { try { client.Close(); } catch { } error = "连接超时"; return false; }
+                if (!connect.Wait(timeoutMs)) { try { client.Close(); } catch { } error = "连接超时"; return false; }
                 connect.GetAwaiter().GetResult();
 
+                client.SendTimeout = Math.Max(200, timeoutMs);
                 string json = JsonHelper.Serialize(msg);
                 byte[] bytes = Encoding.UTF8.GetBytes(json + "\n");
                 var stream = client.GetStream();

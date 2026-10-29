@@ -1,0 +1,3 @@
+D:\ip\LanAutoConfig\bin\slave-slim\LanAutoConfigSlave.pdb
+D:\ip\LanAutoConfig\bin\slave-slim\LanAutoConfig.Common.pdb
+D:\ip\LanAutoConfig\bin\slave-slim\LanAutoConfigSlave.exe

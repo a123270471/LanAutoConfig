@@ -12,6 +12,7 @@ namespace LanAutoConfig.Common
         public const string SlaveResultReport  = "SlaveResultReport";  // TCP：被控端上报执行结果
         public const string MasterResetSession = "MasterResetSession"; // TCP：控制端重置会话，通知终端清空本地
         public const string SlaveHeartbeat     = "SlaveHeartbeat";     // TCP：被控端心跳（在线状态）
+        public const string SlaveOffline       = "SlaveOffline";       // TCP：被控端正常退出，主动告知控制端“我下线了”
         public const string MasterRebootCmd    = "MasterRebootCmd";    // TCP：控制端下发“重启本机”
         public const string MasterAutostartCmd = "MasterAutostartCmd"; // TCP：控制端批量开关“开机自启动”
         public const string MasterShutdownCmd  = "MasterShutdownCmd";  // TCP：控制端下发“关闭本机”
@@ -112,33 +113,23 @@ namespace LanAutoConfig.Common
         public string Dns2 { get; set; }
         public string HostNamePrefix { get; set; }
         public bool IsDhcp { get; set; }
-        /// <summary>执行后加入的工作组（空表示不改）。</summary>
-        public string Workgroup { get; set; }
         /// <summary>时区 ID（空表示不改），如 "China Standard Time"。</summary>
         public string TimeZoneId { get; set; }
         /// <summary>是否与 NTP 服务器对时。</summary>
         public bool SyncTime { get; set; }
-        /// <summary>
-        /// 要加入的域（仅域名，用于被控端界面预览）。
-        /// 域账号/密码刻意<b>不</b>放进广播包：UDP 广播同网段所有机器都能收到，
-        /// 域凭据只在点【下发执行】时用单播的 MasterExecuteCmd 发出去。
-        /// </summary>
-        public string Domain { get; set; }
 
         public BroadcastTemplateMsg() : base() { }
         public BroadcastTemplateMsg(string sessionId, string ipPrefix, string mask, string gw,
             string dns1, string dns2, string hnPrefix, bool isDhcp,
-            string workgroup = null, string timeZoneId = null, bool syncTime = false,
-            string domain = null)
+            string timeZoneId = null, bool syncTime = false)
             : base(MsgTypes.BroadcastTemplate, sessionId)
         {
             IpPrefix = ipPrefix; SubnetMask = mask; Gateway = gw;
             Dns1 = dns1; Dns2 = dns2; HostNamePrefix = hnPrefix; IsDhcp = isDhcp;
-            Workgroup = workgroup; TimeZoneId = timeZoneId; SyncTime = syncTime;
-            Domain = domain;
+            TimeZoneId = timeZoneId; SyncTime = syncTime;
         }
         protected override string StableBody()
-            => $"{IpPrefix}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{HostNamePrefix}|{IsDhcp}|{Workgroup}|{TimeZoneId}|{SyncTime}|{Domain}";
+            => $"{IpPrefix}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{HostNamePrefix}|{IsDhcp}|{TimeZoneId}|{SyncTime}";
     }
 
     /// <summary>6.2 SlaveReport：被控端上报预览配置。</summary>
@@ -176,25 +167,15 @@ namespace LanAutoConfig.Common
         public string Dns2 { get; set; }
         public bool IsDhcp { get; set; }
         public bool NeedAutoReboot { get; set; }
-        /// <summary>执行后加入的工作组（空表示不改）。</summary>
-        public string Workgroup { get; set; }
         /// <summary>时区 ID（空表示不改）。</summary>
         public string TimeZoneId { get; set; }
         /// <summary>是否与 NTP 对时。</summary>
         public bool SyncTime { get; set; }
-        /// <summary>要加入的域（空表示不改）。</summary>
-        public string Domain { get; set; }
-        /// <summary>加域账号（域\用户 或 user@domain）。只在这条单播指令里出现。</summary>
-        public string DomainUser { get; set; }
-        /// <summary>加域密码。注意：局域网内为明文传输，请使用“只能把机器加入指定 OU”的专用低权限账号。</summary>
-        public string DomainPassword { get; set; }
-        /// <summary>目标 OU（可空，如 OU=PC,OU=Room1,DC=corp,DC=local）。</summary>
-        public string OuPath { get; set; }
 
         public MasterExecuteCmdMsg() : base() { }
         public MasterExecuteCmdMsg(string sessionId) : base(MsgTypes.MasterExecuteCmd, sessionId) { }
         protected override string StableBody()
-            => $"{LocalMac}|{TargetHostName}|{TargetIp}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{IsDhcp}|{NeedAutoReboot}|{Workgroup}|{TimeZoneId}|{SyncTime}|{Domain}|{DomainUser}|{DomainPassword}|{OuPath}";
+            => $"{LocalMac}|{TargetHostName}|{TargetIp}|{SubnetMask}|{Gateway}|{Dns1}|{Dns2}|{IsDhcp}|{NeedAutoReboot}|{TimeZoneId}|{SyncTime}";
     }
 
     /// <summary>6.4 SlaveResultReport：被控端回传执行结果。</summary>
@@ -233,6 +214,24 @@ namespace LanAutoConfig.Common
         public SlaveHeartbeatMsg() : base() { }
         public SlaveHeartbeatMsg(string sessionId) : base(MsgTypes.SlaveHeartbeat, sessionId) { }
         protected override string StableBody() => $"{LocalMac}|{HostName}|{LocalIp}|{State}";
+    }
+
+    /// <summary>
+    /// 被控端正常退出时发的一条“告别”消息。
+    /// 没有它，控制端只能等心跳超时（几十秒）才知道这台机器下线了；
+    /// 有了它，点关闭 / 程序重启 / 升级替换的瞬间列表就变离线。仅“正常退出”能发，
+    /// 断电、蓝屏、拔网线仍然只能靠心跳超时兜底。
+    /// </summary>
+    public class SlaveOfflineMsg : NetMessage
+    {
+        public string LocalMac { get; set; }
+        public string HostName { get; set; }
+        /// <summary>下线原因（正常退出 / 重启程序 / 升级替换），仅用于日志。</summary>
+        public string Reason { get; set; }
+
+        public SlaveOfflineMsg() : base() { }
+        public SlaveOfflineMsg(string sessionId) : base(MsgTypes.SlaveOffline, sessionId) { }
+        protected override string StableBody() => $"{LocalMac}|{HostName}|{Reason}";
     }
 
     /// <summary>6.7 MasterRebootCmd：控制端要求某台终端重启（批量重启用）。</summary>
@@ -493,6 +492,7 @@ namespace LanAutoConfig.Common
                     MsgTypes.SlaveResultReport  => JsonSerializer.Deserialize<SlaveResultReportMsg>(json, Opts),
                     MsgTypes.MasterResetSession => JsonSerializer.Deserialize<MasterResetSessionMsg>(json, Opts),
                     MsgTypes.SlaveHeartbeat     => JsonSerializer.Deserialize<SlaveHeartbeatMsg>(json, Opts),
+                    MsgTypes.SlaveOffline       => JsonSerializer.Deserialize<SlaveOfflineMsg>(json, Opts),
                     MsgTypes.MasterRebootCmd    => JsonSerializer.Deserialize<MasterRebootCmdMsg>(json, Opts),
                     MsgTypes.MasterAutostartCmd => JsonSerializer.Deserialize<MasterAutostartCmdMsg>(json, Opts),
                     MsgTypes.MasterShutdownCmd  => JsonSerializer.Deserialize<MasterShutdownCmdMsg>(json, Opts),

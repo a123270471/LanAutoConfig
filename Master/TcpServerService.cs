@@ -15,6 +15,8 @@ namespace LanAutoConfig.Master
         public event Action<SlaveResultReportMsg> OnResultReport;
         /// <summary>收到被控端心跳（在线状态）。</summary>
         public event Action<SlaveHeartbeatMsg> OnHeartbeat;
+        /// <summary>被控端正常退出前的“告别”通知：收到就立刻置离线，不用等心跳超时。</summary>
+        public event Action<SlaveOfflineMsg> OnSlaveOffline;
         /// <summary>收到被控端自定义命令执行结果。</summary>
         public event Action<SlaveCustomResultMsg> OnCustomResult;
         /// <summary>收到被控端验收（当前实际配置）回传。</summary>
@@ -134,6 +136,11 @@ namespace LanAutoConfig.Master
                         // 心跳很频繁（每台 10 秒一条），默认不写日志，只更新在线状态
                         OnHeartbeat?.Invoke(hb);
                     }
+                    else if (msg is SlaveOfflineMsg off)
+                    {
+                        Log?.Invoke($"被控端下线：{remoteIp} MAC={off.LocalMac}（{off.Reason}）");
+                        OnSlaveOffline?.Invoke(off);
+                    }
                     else if (msg is SlaveCustomResultMsg cr)
                     {
                         Log?.Invoke($"收到自定义命令结果：{remoteIp} MAC={cr.LocalMac} 成功={cr.Success} 退出码={cr.ExitCode}");
@@ -167,6 +174,7 @@ namespace LanAutoConfig.Master
         {
             SlaveReportMsg x => x.LocalMac,
             SlaveHeartbeatMsg x => x.LocalMac,
+            SlaveOfflineMsg x => x.LocalMac,
             SlaveResultReportMsg x => x.LocalMac,
             SlaveCustomResultMsg x => x.LocalMac,
             SlaveVerifyResultMsg x => x.LocalMac,

@@ -30,8 +30,12 @@ namespace LanAutoConfig
 
         /// <summary>被控端心跳间隔（毫秒）。</summary>
         public const int HeartbeatIntervalMs = 10000;
-        /// <summary>超过这个时间没收到心跳就算离线（3 个心跳周期 + 余量）。</summary>
-        public const int OfflineAfterMs = HeartbeatIntervalMs * 3 + 2000;
+        /// <summary>
+        /// 超过这个时间没收到心跳就算离线（2 个心跳周期 + 余量，约 22 秒）。
+        /// 原来是 3 个周期 + 余量（32 秒），现场觉得“程序都关了列表还显示在线”太迟钝。
+        /// 正常退出另有 SlaveOffline 即时通知，这里只兜住断电/蓝屏/拔网线这类没有告别消息的情况。
+        /// </summary>
+        public const int OfflineAfterMs = HeartbeatIntervalMs * 2 + 2000;
 
         /// <summary>
         /// 数据目录：优先 %AppData%\LanAutoConfig（控制端 SQLite + 双方日志）。

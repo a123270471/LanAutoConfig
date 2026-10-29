@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "dgSpecHash": "Ndvy5fuBbG6NQCU9eTujWJcXLOquvzCTnM0OOUP3E9DeUXKWHaBhY692uGeRDc63YYxasFN/zE++2Y5YGnxPGA==",
+  "dgSpecHash": "hQPJu8BV0GnheMDOtRyiKmB+m7T8JOpIDt1C5dkQ7g1QJDbM1PwNzSZISiMyMmRyDi+7G8WzSW94oHmMJQGW3Q==",
   "success": true,
   "projectFilePath": "D:\\ip\\LanAutoConfig\\Master\\Master.csproj",
   "expectedPackageFiles": [
@@ -10,10 +10,7 @@
     "C:\\Users\\Administrator\\.nuget\\packages\\sqlitepclraw.core\\2.1.2\\sqlitepclraw.core.2.1.2.nupkg.sha512",
     "C:\\Users\\Administrator\\.nuget\\packages\\sqlitepclraw.lib.e_sqlite3\\2.1.2\\sqlitepclraw.lib.e_sqlite3.2.1.2.nupkg.sha512",
     "C:\\Users\\Administrator\\.nuget\\packages\\sqlitepclraw.provider.e_sqlite3\\2.1.2\\sqlitepclraw.provider.e_sqlite3.2.1.2.nupkg.sha512",
-    "C:\\Users\\Administrator\\.nuget\\packages\\system.memory\\4.5.3\\system.memory.4.5.3.nupkg.sha512",
-    "C:\\Users\\Administrator\\.nuget\\packages\\microsoft.netcore.app.runtime.win-x64\\6.0.36\\microsoft.netcore.app.runtime.win-x64.6.0.36.nupkg.sha512",
-    "C:\\Users\\Administrator\\.nuget\\packages\\microsoft.windowsdesktop.app.runtime.win-x64\\6.0.36\\microsoft.windowsdesktop.app.runtime.win-x64.6.0.36.nupkg.sha512",
-    "C:\\Users\\Administrator\\.nuget\\packages\\microsoft.aspnetcore.app.runtime.win-x64\\6.0.36\\microsoft.aspnetcore.app.runtime.win-x64.6.0.36.nupkg.sha512"
+    "C:\\Users\\Administrator\\.nuget\\packages\\system.memory\\4.5.3\\system.memory.4.5.3.nupkg.sha512"
   ],
   "logs": []
 }

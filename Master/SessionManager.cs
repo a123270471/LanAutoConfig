@@ -156,10 +156,26 @@ namespace LanAutoConfig.Master
             return added;
         }
 
-        /// <summary>在线台数（心跳/上报在 30 秒内）。</summary>
+        /// <summary>在线台数（最近一次心跳在离线阈值内，约 22 秒）。</summary>
         public int OnlineCount
         {
             get { lock (_lock) return Items.Count(x => x.Online); }
+        }
+
+        /// <summary>
+        /// 被控端主动告辞（正常退出 / 重启程序 / 升级替换）：立刻置为离线。
+        /// 把 LastSeen 打到 MinValue，<see cref="SlaveSessionItem.Online"/> 当场变 false，
+        /// 不用再等心跳超时。返回命中的终端（没这条记录时返回 null）。
+        /// </summary>
+        public SlaveSessionItem MarkOffline(string mac)
+        {
+            SlaveSessionItem hit = null;
+            lock (_lock)
+            {
+                hit = Items.FirstOrDefault(x => string.Equals(x.Mac, mac, StringComparison.OrdinalIgnoreCase));
+                if (hit != null) hit.LastSeen = DateTime.MinValue;
+            }
+            return hit;
         }
 
         public void MarkSkip(string mac)

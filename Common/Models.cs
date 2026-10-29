@@ -160,27 +160,16 @@ namespace LanAutoConfig.Common
         public string Dns2 { get; set; }
         public string HostNamePrefix { get; set; }
         public bool IsDhcp { get; set; }
-        /// <summary>执行后要加入的工作组（空表示不改）。</summary>
-        public string Workgroup { get; set; }
         /// <summary>时区 ID（空表示不改），如 "China Standard Time"。</summary>
         public string TimeZoneId { get; set; }
         /// <summary>是否与 NTP 服务器对时。</summary>
         public bool SyncTime { get; set; }
-        /// <summary>要加入的域（空表示不改）。域凭据不在模板里，只在下发执行时单播发出。</summary>
-        public string Domain { get; set; }
-        /// <summary>加域账号（仅控制端本地使用，不随广播下发）。</summary>
-        public string DomainUser { get; set; }
-        /// <summary>加域密码（仅控制端本地使用，不随广播下发）。</summary>
-        public string DomainPassword { get; set; }
-        /// <summary>目标 OU（可空）。</summary>
-        public string OuPath { get; set; }
 
         public static TemplateModel From(BroadcastTemplateMsg m) => new TemplateModel
         {
             IpPrefix = m.IpPrefix, SubnetMask = m.SubnetMask, Gateway = m.Gateway,
             Dns1 = m.Dns1, Dns2 = m.Dns2, HostNamePrefix = m.HostNamePrefix, IsDhcp = m.IsDhcp,
-            Workgroup = m.Workgroup, TimeZoneId = m.TimeZoneId, SyncTime = m.SyncTime,
-            Domain = m.Domain
+            TimeZoneId = m.TimeZoneId, SyncTime = m.SyncTime
         };
     }
 

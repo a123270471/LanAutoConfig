@@ -1,0 +1,3 @@
+D:\ip\_uitest\master\LanAutoConfigMaster.pdb
+D:\ip\_uitest\master\LanAutoConfig.Common.pdb
+D:\ip\_uitest\master\LanAutoConfigMaster.exe

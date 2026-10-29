@@ -30,8 +30,6 @@ namespace LanAutoConfig.Master
         private Label _lblBlacklist, _lblDhcpPool;
         private CheckBox _chkDhcp, _chkDhcpServer;
         private Button _btnStart, _btnStop, _btnReset, _btnManageBlacklist, _btnWhitelist;
-        /// <summary>加域 / 工作组设置入口（按钮文字会显示当前设置摘要）。</summary>
-        private Button _btnDomainJoin;
         private Label _lblSession;
         private ComboBox _cmbAdapter;
 
@@ -66,14 +64,12 @@ namespace LanAutoConfig.Master
         private Queue<SlaveSessionItem> _rebootQueue;
         private int _rebootBatchSize;
 
-        // ---- 本轮新增：文件分发 / 截图 / 流水线 / 加域 / 列显示 ----
+        // ---- 本轮新增：文件分发 / 截图 / 列显示 ----
         /// <summary>控制端内置文件服务（被控端从这里下载安装包/新 exe）。</summary>
         private readonly HttpFileServer _http = new HttpFileServer();
         /// <summary>文件分发结果 / 截屏回传的订阅者（对应对话框）。</summary>
         private event Action<SlaveFileResultMsg> _fileResultHandlers;
         private event Action<SlaveScreenshotResultMsg> _screenshotHandlers;
-        /// <summary>加域参数（域凭据只在本机内存/配置里，不随 UDP 广播下发）。</summary>
-        private string _domain, _domainUser, _domainPassword, _ouPath, _workgroup;
         /// <summary>列表里被隐藏的列名（右键表头可切换，随配置保存）。</summary>
         private readonly HashSet<string> _hiddenColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         // ---- 自动编号（按上线顺序发号）----
@@ -91,8 +87,12 @@ namespace LanAutoConfig.Master
         /// <summary>发号失败日志的节流表（同一台 30 秒内只记一条，否则每秒刷屏）。</summary>
         private readonly Dictionary<string, DateTime> _autoNumberFailLog
             = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
-        private Button _btnAutoNumber;
+        private CheckBox _chkAutoNumber;
         private NumericUpDown _numAutoStart;
+        /// <summary>“下一个编号”的小字提示（勾选后才有内容）。</summary>
+        private Label _lblAutoNumberNext;
+        /// <summary>程序内部改勾选状态时用，避免又触发一次开关切换。</summary>
+        private bool _suppressAutoChk;
 
         private volatile bool _broadcasting;
         private volatile bool _dispatching;
@@ -137,6 +137,7 @@ namespace LanAutoConfig.Master
             _server.OnSlaveReport += r => SafeUi(() => OnSlaveReport(r));
             _server.OnResultReport += r => SafeUi(() => OnResultReport(r));
             _server.OnHeartbeat += r => SafeUi(() => OnHeartbeat(r));
+            _server.OnSlaveOffline += r => SafeUi(() => OnSlaveOffline(r));
             _server.OnCustomResult += r => SafeUi(() => OnCustomResult(r));
             _server.OnVerifyResult += r => SafeUi(() => OnVerifyResult(r));
             _server.OnFileResult += r => SafeUi(() => OnFileResult(r));
@@ -150,7 +151,8 @@ namespace LanAutoConfig.Master
             _autoNumberTimer.Tick += (s, e) => AutoNumberTick();
 
             // 单独的心跳刷新定时器：只重画“在线”列与状态栏，不整表刷新（否则每 10 秒闪一次、还打断编辑）
-            _onlineTimer.Interval = 5000;
+            // 2 秒一次：本来只是重画几格文字，很便宜；5 秒一次会让“已经掉线”的机器多显示好几秒在线。
+            _onlineTimer.Interval = 2000;
             _onlineTimer.Tick += (s, e) => { RefreshOnlineCells(); UpdateStatusBar(); };
             _onlineTimer.Start();
 
@@ -249,6 +251,22 @@ namespace LanAutoConfig.Master
             }
             // 记录在线状态，供后续检测“离线→上线”跳变（预留）
             _onlineState[hb.LocalMac] = true;
+        }
+
+        /// <summary>
+        /// 被控端正常退出（关程序 / 重启程序 / 升级替换）时发来的告别通知：
+        /// 立刻把这台置为离线并刷新那一格，不用等心跳超时（原来要等 32 秒 + 最多 5 秒重画）。
+        /// </summary>
+        private void OnSlaveOffline(SlaveOfflineMsg m)
+        {
+            if (m.SessionId != _session.SessionId) return;
+            var it = _session.MarkOffline(m.LocalMac);
+            if (it == null) return;
+            UpdateOnlineCell(it.Mac);
+            UpdateStatusBar();
+            LogLine($"{it.TargetHostName ?? m.LocalMac} 已下线：{m.Reason}");
+            // 自动编号里挂着的待确认号：这台已经下线了，别再去补发
+            _autoNumberPending.Remove(it.Mac);
         }
 
         /// <summary>
@@ -811,14 +829,13 @@ namespace LanAutoConfig.Master
         }
 
         /// <summary>
-        /// 真正逐台发执行指令（后台线程调用）：带令牌、带加域参数，失败退回“待执行”以便重试。
+        /// 真正逐台发执行指令（后台线程调用）：带令牌，失败退回“待执行”以便重试。
         /// 返回成功台数。供【下发执行命令】等批量操作共用。
         /// </summary>
         internal int DispatchExecute(IReadOnlyList<SlaveSessionItem> items)
         {
             if (items == null || items.Count == 0) return 0;
             string sessionId = _session.SessionId;
-            string domain = _domain, domainUser = _domainUser, domainPwd = _domainPassword, ou = _ouPath, wg = _workgroup;
             int ok = 0;
 
             foreach (var it in items)
@@ -833,12 +850,7 @@ namespace LanAutoConfig.Master
                     Dns1 = it.Dns1,
                     Dns2 = it.Dns2,
                     IsDhcp = it.IsDhcp,
-                    NeedAutoReboot = false,
-                    Workgroup = string.IsNullOrWhiteSpace(domain) ? wg : null,   // 加域与工作组二选一
-                    Domain = string.IsNullOrWhiteSpace(domain) ? null : domain,
-                    DomainUser = domainUser,
-                    DomainPassword = domainPwd,
-                    OuPath = ou
+                    NeedAutoReboot = false
                 };
                 if (SendToItem(it, msg, out string err))
                 {
@@ -1028,23 +1040,6 @@ namespace LanAutoConfig.Master
             dlg.ShowDialog(this);
         }
 
-        /// <summary>加域 / 工作组设置（只改控制端本地参数，随模板一起下发）。</summary>
-        private void ShowDomainJoinDialog()
-        {
-            using var dlg = new DomainJoinForm(_workgroup, _domain, _domainUser, _domainPassword, _ouPath);
-            if (dlg.ShowDialog(this) != DialogResult.OK) return;
-            _workgroup = dlg.Workgroup;
-            _domain = dlg.DomainName;
-            _domainUser = dlg.DomainUser;
-            _domainPassword = dlg.DomainPassword;
-            _ouPath = dlg.OuPath;
-            ScheduleSave();
-            UpdateDomainHint();
-            LogLine(string.IsNullOrEmpty(_domain)
-                ? $"加域设置已更新：工作组「{_workgroup ?? "(不改)"}」"
-                : $"加域设置已更新：域「{_domain}」账号 {_domainUser}" + (string.IsNullOrEmpty(_ouPath) ? "" : $"，OU {_ouPath}"));
-        }
-
         // ---------- 列显示自定义 ----------
 
         /// <summary>右键表头：勾选要显示的列（终端多了以后可以隐藏不关心的列）。</summary>
@@ -1092,15 +1087,6 @@ namespace LanAutoConfig.Master
             if (_grid == null || _grid.IsDisposed) return;
             foreach (DataGridViewColumn col in _grid.Columns)
                 col.Visible = !_hiddenColumns.Contains(col.Name);
-        }
-
-        /// <summary>把当前加域/工作组设置显示在按钮上，一眼能看出这轮会不会加域。</summary>
-        private void UpdateDomainHint()
-        {
-            if (_btnDomainJoin == null || _btnDomainJoin.IsDisposed) return;
-            if (!string.IsNullOrWhiteSpace(_domain)) _btnDomainJoin.Text = "加域：" + _domain;
-            else if (!string.IsNullOrWhiteSpace(_workgroup)) _btnDomainJoin.Text = "工作组：" + _workgroup;
-            else _btnDomainJoin.Text = "加域/工作组设置…";
         }
 
         private void BatchDeleteSelected()
@@ -1280,9 +1266,9 @@ namespace LanAutoConfig.Master
         }
 
         /// <summary>
-        /// 自动编号开关（工具栏上的那个按钮）。
+        /// 自动编号开关（工具栏上的那个勾选框）。
         ///
-        /// 打开后不再需要手工点一次“按上线顺序编号”：列表里每出现一台“在线未上报”的终端，
+        /// 勾上后不再需要手工点一次“按上线顺序编号”：列表里每出现一台“在线未上报”的终端，
         /// 就按会话顺序（= 真实上线先后）把下一个编号发过去，被控端收到后自动填号并上报，
         /// 于是第一台上报 01、第二台 02…… 起始号可以在工具栏上预先设定。
         /// </summary>
@@ -1293,10 +1279,12 @@ namespace LanAutoConfig.Master
                 MessageBox.Show("请先点【开始发布模板】。\n\n" +
                                 "被控端要先收到本批次的模板，才会接受编号指令并把编号换算成主机名/IP。",
                     "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                SetAutoNumberChecked(false);   // 勾选框要弹回去，否则界面显示“开”但其实没开
                 return;
             }
 
             _autoNumberOn = on;
+            SetAutoNumberChecked(on);
             if (on)
             {
                 // 每次开启都从“起始号”重新算：现场常常是“这一批从 20 号开始”这种用法
@@ -1333,19 +1321,20 @@ namespace LanAutoConfig.Master
             ScheduleSave();
         }
 
+        /// <summary>勾选框状态与内部开关对齐；程序内部改状态时不要再触发一次 SetAutoNumber。</summary>
+        private void SetAutoNumberChecked(bool on)
+        {
+            if (_chkAutoNumber == null || _chkAutoNumber.IsDisposed) return;
+            if (_chkAutoNumber.Checked == on) return;
+            _suppressAutoChk = true;
+            try { _chkAutoNumber.Checked = on; } finally { _suppressAutoChk = false; }
+        }
+
+        /// <summary>刷新“下一个编号”提示（勾选框后面那行小字）。</summary>
         private void UpdateAutoNumberHint()
         {
-            if (_btnAutoNumber == null || _btnAutoNumber.IsDisposed) return;
-            if (_autoNumberOn)
-            {
-                _btnAutoNumber.Text = $"自动编号：开（下一个 {_autoNumberNext:00}）";
-                _btnAutoNumber.Width = 170;
-            }
-            else
-            {
-                _btnAutoNumber.Text = "自动编号：关";
-                _btnAutoNumber.Width = 118;
-            }
+            if (_lblAutoNumberNext == null || _lblAutoNumberNext.IsDisposed) return;
+            _lblAutoNumberNext.Text = _autoNumberOn ? $"→ 下一个 {_autoNumberNext:00}" : "";
         }
 
         /// <summary>会话重置 / 换批次：编号从起始号重新开始。</summary>
@@ -1447,6 +1436,7 @@ namespace LanAutoConfig.Master
                             "剩下的终端不再发号；请调整起始号或改用其他网段");
                     _autoNumberOn = false;
                     _autoNumberTimer.Stop();
+                    SetAutoNumberChecked(false);
                 }
 
                 UpdateAutoNumberHint();
@@ -1703,7 +1693,7 @@ namespace LanAutoConfig.Master
                         it.Mac, it.OnlineDisplay, it.SourceIp, it.Suffix, it.TargetHostName, it.TargetIp,
                         it.SubnetMask, it.Gateway, it.Dns1, it.Dns2,
                         it.IsDhcp ? "DHCP" : "静态",
-                        it.StatusDisplay, it.ErrorMsg, conflict ? "冲突" : "",
+                        conflict ? "冲突" : "",
                         verifyText, it.FailCategory ?? "");
                     var row = _grid.Rows[idx];
                     row.Tag = it;
@@ -1719,9 +1709,11 @@ namespace LanAutoConfig.Master
                     }
                     if (!string.IsNullOrEmpty(it.FailSuggestion))
                         row.Cells["colFailCat"].ToolTipText = it.FailSuggestion;
-                    // 错误信息即使折行也可能看不全（被窗口高度限制），悬停给完整原文
+                    // 失败原因不再单列一列（太占宽度）：挂在“失败归类”单元格的悬停提示上
                     if (!string.IsNullOrEmpty(it.ErrorMsg))
-                        row.Cells["colErr"].ToolTipText = it.ErrorMsg;
+                        row.Cells["colFailCat"].ToolTipText =
+                            string.IsNullOrEmpty(it.FailSuggestion) ? it.ErrorMsg
+                            : it.FailSuggestion + Environment.NewLine + it.ErrorMsg;
                     // 资产摘要挂在 MAC 单元格的提示上，点开不占列宽
                     if (!string.IsNullOrEmpty(it.HardwareSummary))
                         row.Cells["colMac"].ToolTipText =
@@ -2016,10 +2008,7 @@ namespace LanAutoConfig.Master
             return new TemplateModel
             {
                 IpPrefix = ipPrefix, SubnetMask = mask, Gateway = gw,
-                Dns1 = dns1, Dns2 = dns2, HostNamePrefix = hn, IsDhcp = dhcp,
-                // 工作组/域只需域名进广播（用于被控端界面显示），域凭据留在控制端，下发执行时才单播
-                Workgroup = string.IsNullOrWhiteSpace(_domain) ? _workgroup : null,
-                Domain = string.IsNullOrWhiteSpace(_domain) ? null : _domain
+                Dns1 = dns1, Dns2 = dns2, HostNamePrefix = hn, IsDhcp = dhcp
             };
         }
 
@@ -2168,12 +2157,7 @@ namespace LanAutoConfig.Master
                 Margin = new Padding(0, 4, 0, 0)
             };
             tbl.Controls.Add(_chkDhcp, 1, 3);
-
-            _btnDomainJoin = new Button { Text = "加域/工作组设置…", Height = 26, Dock = DockStyle.Fill, Margin = new Padding(0, 2, 0, 0) };
-            _btnDomainJoin.Click += (s, e) => ShowDomainJoinDialog();
-            tbl.Controls.Add(_btnDomainJoin, 3, 3);
-            var tipDomain = new ToolTip();
-            tipDomain.SetToolTip(_btnDomainJoin, "执行配置时顺便加入域或工作组（域凭据只在单播的执行指令里，不随广播下发）");
+            tbl.SetColumnSpan(_chkDhcp, 3);
 
             var lblHint = new Label
             {
@@ -2226,101 +2210,166 @@ namespace LanAutoConfig.Master
 
             // ==================== Tab2 终端列表 ====================
             var tab2 = new TabPage("终端列表") { Padding = new Padding(10) };
-            var bar2 = new FlowLayoutPanel
+
+            // 工具条：固定 4 行、每行一个 FlowLayoutPanel（WrapContents=false）。
+            // 之前是一个自动折行的 FlowLayoutPanel，按钮宽窄不一、窗口一拉就乱跳；
+            // 现在按“编号与下发 / 电源 / 运维 / 列表”分组，每行不许折行，宽度按最长文字统一。
+            var bar2 = new TableLayoutPanel
             {
                 Dock = DockStyle.Top,
-                AutoSize = true,                      // 按钮放不下时自动折成两行，不再被固定高度裁掉
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                Padding = new Padding(0, 2, 0, 6),
-                WrapContents = true
-            };
-            _btnDispatch = new Button { Text = "下发执行命令", Width = 140, Height = 32 };
-            MakePrimary(_btnDispatch);
-            _btnDispatch.Click += btnDispatch_Click;
-            _btnExportTerminals = new Button { Text = "导出终端列表 CSV", Width = 150, Height = 32 };
-            _btnExportTerminals.Click += btnExportTerminalsCsv_Click;
-            var btnSelectAll = new Button { Text = "全选", Width = 70, Height = 32 };
-            btnSelectAll.Click += (s, e) => { _grid.SelectAll(); };
-            var btnRefresh = new Button { Text = "刷新列表", Width = 90, Height = 32 };
-            btnRefresh.Click += (s, e) => RefreshTerminalList();
-
-            // ---- 第二行：自动编号（开关）+ 电源类 + 自启 ----
-            // 这里是“开关”而不是一次性按钮：打开后，每有一台新机器上线（在线未上报），
-            // 就自动把下一个编号发给它，被控端收到后自己填号并自动上报（01、02、03…）。
-            _btnAutoNumber = new Button { Text = "自动编号：关", Width = 118, Height = 32 };
-            _btnAutoNumber.Click += (s, e) => SetAutoNumber(!_autoNumberOn);
-            var lblAutoStart = new Label
-            {
-                Text = "起始号：",
+                ColumnCount = 1,
+                RowCount = 4,
                 AutoSize = true,
-                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
-                Margin = new Padding(6, 9, 0, 0)
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Margin = new Padding(0),
+                Padding = new Padding(0, 0, 0, 2)
             };
+            for (int i = 0; i < 4; i++) bar2.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+
+            FlowLayoutPanel NewBarRow() => new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                WrapContents = false,
+                AutoScroll = false,
+                Margin = new Padding(0),
+                Padding = new Padding(0, 4, 0, 0)
+            };
+
+            // 统一按钮外观：高度一致、左边距一致，行内不再出现“高矮不齐”
+            Button BarButton(string text, int width = 104)
+            {
+                var b = new Button { Text = text, Width = width, Height = 28, Margin = new Padding(0, 2, 6, 0) };
+                return b;
+            }
+
+            // 分组之间的竖线（FlowLayoutPanel 里放一个 1px 的 Panel 即可）
+            Panel BarSep() => new Panel
+            {
+                Width = 1,
+                Height = 20,
+                BackColor = System.Drawing.Color.FromArgb(215, 219, 224),
+                Margin = new Padding(4, 7, 10, 0)
+            };
+
+            // ---- 第 1 行：自动编号（勾选框）+ 下发执行 + 验收 ----
+            // 这里是“开关”而不是一次性按钮：勾上后，每有一台新机器上线（在线未上报），
+            // 就自动把下一个编号发给它，被控端收到后自己填号并自动上报（01、02、03…）。
+            var row1 = NewBarRow();
+            _chkAutoNumber = new CheckBox
+            {
+                Text = "自动编号",
+                AutoSize = true,
+                Margin = new Padding(2, 8, 2, 0),
+                Checked = false
+            };
+            _chkAutoNumber.CheckedChanged += (s, e) =>
+            {
+                if (_suppressAutoChk) return;
+                SetAutoNumber(_chkAutoNumber.Checked);
+            };
+            row1.Controls.Add(_chkAutoNumber);
+            row1.Controls.Add(new Label
+            {
+                Text = "起始号",
+                AutoSize = true,
+                ForeColor = System.Drawing.Color.DimGray,
+                Margin = new Padding(4, 10, 4, 0)
+            });
             _numAutoStart = new NumericUpDown
             {
                 Minimum = 1, Maximum = SuffixPlanner.MaxSuffix, Value = 1,
-                Width = 60, Height = 30,
-                Margin = new Padding(0, 4, 8, 0),
+                Width = 58, Height = 26,
+                Margin = new Padding(0, 6, 2, 0),
                 TextAlign = HorizontalAlignment.Center
             };
             _numAutoStart.ValueChanged += (s, e) => OnAutoStartChanged();
-            var btnReboot = new Button { Text = "批量重启", Width = 90, Height = 32 };
-            btnReboot.Click += (s, e) => BatchRebootSelected();
-            var btnShutdown = new Button { Text = "批量关机", Width = 90, Height = 32 };
-            btnShutdown.Click += (s, e) => BatchShutdownSelected();
-            var btnWol = new Button { Text = "WOL 唤醒", Width = 96, Height = 32 };
-            btnWol.Click += (s, e) => WakeSelected();
-            var btnAutostartOn = new Button { Text = "开启自启", Width = 90, Height = 32 };
-            btnAutostartOn.Click += (s, e) => BatchSetAutostartSelected(true);
-            var btnAutostartOff = new Button { Text = "取消自启", Width = 90, Height = 32 };
-            btnAutostartOff.Click += (s, e) => BatchSetAutostartSelected(false);
+            row1.Controls.Add(_numAutoStart);
+            _lblAutoNumberNext = new Label
+            {
+                Text = "",
+                AutoSize = true,
+                ForeColor = System.Drawing.Color.FromArgb(0, 120, 212),
+                Margin = new Padding(6, 10, 12, 0)
+            };
+            row1.Controls.Add(_lblAutoNumberNext);
+            row1.Controls.Add(BarSep());
 
-            var tipBar = new ToolTip();
-            tipBar.SetToolTip(_btnAutoNumber,
-                "打开后按“上线先后”自动发号：第一台在线未上报的机器拿 01，第二台 02…\n" +
-                "被控端收到编号后自动填好并提交上报；起始号用右边的小框预先设定。");
-            tipBar.SetToolTip(_numAutoStart, "自动编号的起始号（1~253，对应 IP 末段 2~254）");
-            tipBar.SetToolTip(btnReboot, "被控端执行 shutdown /r /t 10（10 秒后重启）");
-            tipBar.SetToolTip(btnShutdown, "被控端执行 shutdown /s /t 10（10 秒后关机，之后该终端离线）");
-            tipBar.SetToolTip(btnWol, "向关机中的终端发送 WOL 魔术包（需同一广播域且 BIOS/网卡开启网络唤醒）");
-            tipBar.SetToolTip(btnAutostartOn, "被控端写入注册表 Run 项：开机自动运行本程序（沿用原静默参数）");
-            tipBar.SetToolTip(btnAutostartOff, "被控端删除注册表 Run 项：开机不再自动运行（不影响当前运行）");
+            _btnDispatch = BarButton("下发执行命令", 120);
+            MakePrimary(_btnDispatch);
+            _btnDispatch.Click += btnDispatch_Click;
+            row1.Controls.Add(_btnDispatch);
 
-            bar2.Controls.Add(_btnDispatch);
-            bar2.Controls.Add(_btnExportTerminals);
-            bar2.Controls.Add(btnSelectAll);
-            bar2.Controls.Add(btnRefresh);
-            bar2.SetFlowBreak(btnRefresh, true);      // 显式分成两行，不靠容器宽度“碰运气”
-            bar2.Controls.Add(_btnAutoNumber);
-            bar2.Controls.Add(lblAutoStart);
-            bar2.Controls.Add(_numAutoStart);
-            bar2.Controls.Add(btnReboot);
-            bar2.Controls.Add(btnShutdown);
-            bar2.Controls.Add(btnWol);
-            bar2.Controls.Add(btnAutostartOn);
-            bar2.Controls.Add(btnAutostartOff);
-
-            // ---- 第三行：自定义命令 / 分批重启 / 验收 ----
-            var btnCustomCmd = new Button { Text = "自定义命令", Width = 100, Height = 32 };
-            btnCustomCmd.Click += (s, e) => ShowCustomCmdDialog();
-            var btnStagger = new Button { Text = "分批错峰重启", Width = 120, Height = 32 };
-            btnStagger.Click += (s, e) => ShowStaggerRebootDialog();
-            var btnVerify = new Button { Text = "验收选中", Width = 100, Height = 32 };
+            var btnVerify = BarButton("验收选中", 96);
             btnVerify.Click += (s, e) => VerifySelected();
-            tipBar.SetToolTip(btnCustomCmd, "向选中终端（未选中则全部在线）下发 PowerShell / CMD 脚本或命令，并收回结果");
-            tipBar.SetToolTip(btnStagger, "把选中终端分多批、每批间隔若干秒下发重启，避免同时重启压垮交换机/域控；上线后自动验收");
-            tipBar.SetToolTip(btnVerify, "向选中终端（未选中则全部在线）下发验收指令，比对实际计算机名/IP 与期望值");
-            bar2.Controls.Add(btnCustomCmd);
-            bar2.Controls.Add(btnStagger);
-            bar2.Controls.Add(btnVerify);
+            row1.Controls.Add(btnVerify);
 
-            // ---- 第四行：文件分发 / 远程截图 / 程序控制 / 网络扫描 ----
-            bar2.SetFlowBreak(btnVerify, true);
-            var btnFilePush = new Button { Text = "文件分发", Width = 100, Height = 32 };
+            var btnCustomCmd = BarButton("自定义命令", 104);
+            btnCustomCmd.Click += (s, e) => ShowCustomCmdDialog();
+            row1.Controls.Add(btnCustomCmd);
+
+            // ---- 第 2 行：电源与自启 ----
+            var row2 = NewBarRow();
+            var btnReboot = BarButton("批量重启", 96);
+            btnReboot.Click += (s, e) => BatchRebootSelected();
+            row2.Controls.Add(btnReboot);
+
+            var btnShutdown = BarButton("批量关机", 96);
+            btnShutdown.Click += (s, e) => BatchShutdownSelected();
+            row2.Controls.Add(btnShutdown);
+
+            var btnStagger = BarButton("分批错峰重启", 120);
+            btnStagger.Click += (s, e) => ShowStaggerRebootDialog();
+            row2.Controls.Add(btnStagger);
+
+            var btnWol = BarButton("WOL 唤醒", 96);
+            btnWol.Click += (s, e) => WakeSelected();
+            row2.Controls.Add(btnWol);
+            row2.Controls.Add(BarSep());
+
+            var btnAutostartOn = BarButton("开启自启", 96);
+            btnAutostartOn.Click += (s, e) => BatchSetAutostartSelected(true);
+            row2.Controls.Add(btnAutostartOn);
+
+            var btnAutostartOff = BarButton("取消自启", 96);
+            btnAutostartOff.Click += (s, e) => BatchSetAutostartSelected(false);
+            row2.Controls.Add(btnAutostartOff);
+
+            // ---- 第 3 行：运维（程序控制 / 文件 / 截屏 / 网络诊断）----
+            var row3 = NewBarRow();
+            var btnProc = BarButton("重启被控端", 110);
+            row3.Controls.Add(btnProc);
+
+            var btnFilePush = BarButton("文件分发", 96);
             btnFilePush.Click += (s, e) => ShowFilePushDialog();
-            var btnShot = new Button { Text = "远程截图", Width = 100, Height = 32 };
+            row3.Controls.Add(btnFilePush);
+
+            var btnShot = BarButton("远程截图", 96);
             btnShot.Click += (s, e) => ShowScreenshotDialog();
-            var btnProc = new Button { Text = "重启被控端", Width = 110, Height = 32 };
+            row3.Controls.Add(btnShot);
+            row3.Controls.Add(BarSep());
+
+            var btnIpScan = BarButton("IP占用扫描", 110);
+            btnIpScan.Click += (s, e) => ShowIpScanDialog();
+            row3.Controls.Add(btnIpScan);
+
+            var btnProbe = BarButton("连通性检测", 110);
+            btnProbe.Click += (s, e) => ShowConnectivityDialog();
+            row3.Controls.Add(btnProbe);
+
+            // ---- 第 4 行：列表工具 ----
+            var row4 = NewBarRow();
+            var btnSelectAll = BarButton("全选", 78);
+            btnSelectAll.Click += (s, e) => { _grid.SelectAll(); };
+            row4.Controls.Add(btnSelectAll);
+
+            var btnRefresh = BarButton("刷新列表", 96);
+            btnRefresh.Click += (s, e) => RefreshTerminalList();
+            row4.Controls.Add(btnRefresh);
+
+            _btnExportTerminals = BarButton("导出终端列表 CSV", 140);
+            _btnExportTerminals.Click += btnExportTerminalsCsv_Click;
+            row4.Controls.Add(_btnExportTerminals);
+
             btnProc.Click += (s, e) =>
             {
                 var items = SelectedItemsOrAllOnline();
@@ -2330,21 +2379,30 @@ namespace LanAutoConfig.Master
                         MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
                 RestartSlaveApp(items);
             };
-            var btnIpScan = new Button { Text = "IP占用扫描", Width = 110, Height = 32 };
-            btnIpScan.Click += (s, e) => ShowIpScanDialog();
-            var btnProbe = new Button { Text = "连通性检测", Width = 110, Height = 32 };
-            btnProbe.Click += (s, e) => ShowConnectivityDialog();
 
+            var tipBar = new ToolTip();
+            tipBar.SetToolTip(_chkAutoNumber,
+                "勾上后按“上线先后”自动发号：第一台在线未上报的机器拿 01，第二台 02…\n" +
+                "被控端收到编号后自动填好并提交上报；起始号用右边的小框预先设定。");
+            tipBar.SetToolTip(_numAutoStart, "自动编号的起始号（1~253，对应 IP 末段 2~254）");
+            tipBar.SetToolTip(btnReboot, "被控端执行 shutdown /r /t 10（10 秒后重启）");
+            tipBar.SetToolTip(btnShutdown, "被控端执行 shutdown /s /t 10（10 秒后关机，之后该终端离线）");
+            tipBar.SetToolTip(btnWol, "向关机中的终端发送 WOL 魔术包（需同一广播域且 BIOS/网卡开启网络唤醒）");
+            tipBar.SetToolTip(btnAutostartOn, "被控端写入注册表 Run 项：开机自动运行本程序（沿用原静默参数）");
+            tipBar.SetToolTip(btnAutostartOff, "被控端删除注册表 Run 项：开机不再自动运行（不影响当前运行）");
+            tipBar.SetToolTip(btnCustomCmd, "向选中终端（未选中则全部在线）下发 PowerShell / CMD 脚本或命令，并收回结果");
+            tipBar.SetToolTip(btnStagger, "把选中终端分多批、每批间隔若干秒下发重启，避免同时重启压垮交换机；上线后自动验收");
+            tipBar.SetToolTip(btnVerify, "向选中终端（未选中则全部在线）下发验收指令，比对实际计算机名/IP 与期望值");
             tipBar.SetToolTip(btnFilePush, "把安装包/脚本推到被控端并静默执行（内置文件服务，带 SHA256 校验）");
             tipBar.SetToolTip(btnShot, "让被控端截一张当前桌面回传，看它卡在哪个界面");
             tipBar.SetToolTip(btnProc, "只重启被控端程序（不重启电脑），程序卡死时用");
             tipBar.SetToolTip(btnIpScan, "扫描目标 IP 在网段里是否已被别的机器占用（读 ARP 表，能发现模板冲突之外的“老机器占地址”）");
             tipBar.SetToolTip(btnProbe, "同时探 ping 和 48889 端口：分清是掉线、还是机器在但被控端没跑/被防火墙拦");
-            bar2.Controls.Add(btnFilePush);
-            bar2.Controls.Add(btnShot);
-            bar2.Controls.Add(btnProc);
-            bar2.Controls.Add(btnIpScan);
-            bar2.Controls.Add(btnProbe);
+
+            bar2.Controls.Add(row1, 0, 0);
+            bar2.Controls.Add(row2, 0, 1);
+            bar2.Controls.Add(row3, 0, 2);
+            bar2.Controls.Add(row4, 0, 3);
 
             _lblGridHint = new Label
             {
@@ -2405,8 +2463,6 @@ namespace LanAutoConfig.Master
             _grid.Columns.Add("colDns", "DNS1");
             _grid.Columns.Add("colDns2", "DNS2");
             _grid.Columns.Add("colMode", "模式");
-            _grid.Columns.Add("colStatus", "状态");
-            _grid.Columns.Add("colErr", "错误信息");
             _grid.Columns.Add("colConf", "冲突");
             _grid.Columns.Add("colVerify", "验收");
             _grid.Columns.Add("colFailCat", "失败归类");
@@ -2541,11 +2597,6 @@ namespace LanAutoConfig.Master
                     // 注意：下拉框里的元素是 BroadcastAdapter（包了一层网卡信息 + 该网卡的 IPv4），
                     // 原来这里写的是 as NetworkAdapterInfo，永远转不成 null，等于“选的网卡从来没被记住”。
                     AdapterAlias = (_cmbAdapter.SelectedItem as BroadcastAdapter)?.Adapter?.Alias,
-                    Workgroup = _workgroup,
-                    Domain = _domain,
-                    DomainUser = _domainUser,
-                    DomainPassword = _domainPassword,
-                    OuPath = _ouPath,
                     HiddenColumns = _hiddenColumns.ToList(),
                     AutoNumberStart = (int)(_numAutoStart?.Value ?? 1),
                     Items = _session.Items.ToList()
@@ -2577,13 +2628,6 @@ namespace LanAutoConfig.Master
                 if (!string.IsNullOrEmpty(s.HostNamePrefix)) _txtHnPrefix.Text = s.HostNamePrefix;
                 _chkDhcp.Checked = s.IsDhcp;
                 _chkDhcpServer.Checked = s.DhcpServer;
-
-                _workgroup = s.Workgroup;
-                _domain = s.Domain;
-                _domainUser = s.DomainUser;
-                _domainPassword = s.DomainPassword;
-                _ouPath = s.OuPath;
-                UpdateDomainHint();
 
                 _hiddenColumns.Clear();
                 foreach (string c in s.HiddenColumns) if (!string.IsNullOrWhiteSpace(c)) _hiddenColumns.Add(c);

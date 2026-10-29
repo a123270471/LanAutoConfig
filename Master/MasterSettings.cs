@@ -18,21 +18,9 @@ namespace LanAutoConfig.Master
         public string HostNamePrefix { get; set; } = "PC-ROOM01-";
         public bool IsDhcp { get; set; }
         public bool DhcpServer { get; set; }
-        public string Workgroup { get; set; }
         public string TimeZoneId { get; set; }
         public bool SyncTime { get; set; }
         public string AdapterAlias { get; set; }
-        /// <summary>加域用的域名（空表示不加域）。</summary>
-        public string Domain { get; set; }
-        /// <summary>加域账号。</summary>
-        public string DomainUser { get; set; }
-        /// <summary>
-        /// 加域密码。以明文保存在本机配置文件里（%AppData%），同机的管理员能读到；
-        /// 现场请使用「只能把计算机加入指定 OU」的专用低权限账号，不要用域管理员账号。
-        /// </summary>
-        public string DomainPassword { get; set; }
-        /// <summary>目标 OU（可空）。</summary>
-        public string OuPath { get; set; }
         /// <summary>列表里被隐藏的列（列名），下次启动保持同样的显示。</summary>
         public List<string> HiddenColumns { get; set; } = new List<string>();
         /// <summary>
